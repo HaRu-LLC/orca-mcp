@@ -72,6 +72,7 @@ import {
 import {
   createCliPolicy,
   resolveCliPolicyConfig,
+  RAW_CLI_OK_PREFIXES,
 } from './lib/cli-policy.mjs';
 import { createToolsetGate } from './lib/toolsets.mjs';
 import {
@@ -129,6 +130,7 @@ import {
   SIGNED_STORE_MISSING,
 } from './lib/store-signer.mjs';
 import { executeReleaseWorker } from './lib/release-worker.mjs';
+import { cleanupDispatchWorktree } from './lib/worktree-cleanup.mjs';
 import {
   resolveWorkerIsolationConfig,
   planIsolatedAgentPlacement,
@@ -160,6 +162,14 @@ import {
   bindHttpRequestAbort,
 } from './lib/await-lifecycle.mjs';
 import { hardenIsolatedWorktree, inferExpectedGitdir } from './lib/worktree-acl.mjs';
+import {
+  buildCreationRecord,
+  launchOutcomeTerminalHandle,
+  mayAddListedHandles,
+  parseCreationRecords,
+  matchCreationRecord,
+  verifyLiveTerminal,
+} from './lib/creation-records.mjs';
 
 const execFile = promisify(execFileCb);
 
@@ -217,6 +227,10 @@ const WORKER_ISOLATION = resolveWorkerIsolationConfig(process.env);
 // Hardening governs allowlisting only. action=release gates via requireOwned*.
 const CLI_POLICY = createCliPolicy({
   ...resolveCliPolicyConfig(process.env),
+  // action=cli から terminal close を外す（action=release の内部 close は runJson 経由で影響なし）。
+  allowPrefixes: RAW_CLI_OK_PREFIXES.filter(
+    (p) => !(p[0] === 'terminal' && p[1] === 'close'),
+  ),
   admin: TOOLSET_GATE.admin,
   onWarning: (warning) => {
     console.error(JSON.stringify({
@@ -386,6 +400,9 @@ const SENDER_PIN_STORE = path.join(os.homedir(), '.orca-bridge-sender-pins.json'
 // Override dir with ORCA_BRIDGE_AUDIT_DIR; default ~/.orca-bridge/audit.ndjson
 const AUDIT_DIR = (process.env.ORCA_BRIDGE_AUDIT_DIR || '').trim()
   || path.join(os.homedir(), '.orca-bridge');
+// Creation records for action=reclaim (local patch). Unsigned, 0600, append-only.
+const CREATION_STORE = path.join(AUDIT_DIR, 'creations.ndjson');
+const CREATION_READ_MAX_BYTES = 2 * 1024 * 1024;
 /**
  * Separate-uid store signer (NAS-249 / NAS-253).
  * Socket path in production; ORCA_BRIDGE_STORE_SIGNER_KEY only for tests/isolated HOME.
@@ -1554,6 +1571,151 @@ async function markWorkerCapPurge(dispatchId) {
  *   → optional send --text … --enter + empty --enter recovery (TUI draft buffer)
  */
 async function dispatchWorker(args = {}) {
+  // Local patch: whatever stage dispatch ends at, record what it created so a
+  // lost (restart) or never-bound (mid-dispatch failure) worker can be reclaimed.
+  const ctx = {};
+  const clientKey = currentClientKey();
+  let result;
+  try {
+    result = await dispatchWorkerInner(args, ctx);
+    return result;
+  } finally {
+    try {
+      await recordCreation({
+        steps: ctx.steps,
+        result,
+        args: { ...args, agent: ctx.agent, name: ctx.name, worktree: ctx.worktreeMode },
+        clientKey,
+      });
+    } catch (e) {
+      console.error('WARN: cannot write creation record:', e?.message || e);
+    }
+  }
+}
+
+async function recordCreation({ steps, result, args, clientKey }) {
+  const record = buildCreationRecord({ steps, result, args, clientKey });
+  if (!record) return null;
+  if (mayAddListedHandles(record)) {
+    const listed = await runJson(
+      ['terminal', 'list', '--worktree', `path:${record.worktreePath}`, '--json'],
+      { timeoutMs: 15_000 },
+    );
+    const terms = listed?.envelope?.result?.terminals;
+    if (Array.isArray(terms)) {
+      for (const t of terms) {
+        const h = t && t.handle != null ? String(t.handle).trim() : '';
+        if (h && !record.handles.includes(h)) record.handles.push(h);
+      }
+    }
+  }
+  if (!fs.existsSync(AUDIT_DIR)) fs.mkdirSync(AUDIT_DIR, { recursive: true, mode: 0o700 });
+  fs.appendFileSync(CREATION_STORE, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+  try { fs.chmodSync(CREATION_STORE, 0o600); } catch { /* best effort */ }
+  return record;
+}
+
+function readCreationRecords() {
+  if (!fs.existsSync(CREATION_STORE)) return [];
+  const st = fs.statSync(CREATION_STORE);
+  const fd = fs.openSync(CREATION_STORE, 'r');
+  try {
+    const len = Math.min(st.size, CREATION_READ_MAX_BYTES);
+    const buf = Buffer.alloc(len);
+    fs.readSync(fd, buf, 0, len, st.size - len);
+    let text = buf.toString('utf8');
+    if (len < st.size) text = text.slice(text.indexOf('\n') + 1); // drop partial first line
+    return parseCreationRecords(text);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/**
+ * action=reclaim — restore ownership of a worker this client created, only when
+ * (1) a creation record of THIS clientKey matches the given id, and (2) Orca's
+ * live terminal list shows the handle inside the recorded worktree, and (3) the
+ * handle is not a sender/coordinator terminal nor owned by another client.
+ */
+async function reclaimWorker({ terminal_handle, dispatch_id, task_id } = {}) {
+  const ck = currentClientKey();
+  const deny = (code, detail) => ({
+    ok: false,
+    error: 'reclaim_denied',
+    code,
+    detail,
+    next: { action: 'guide', detail: 'reclaim needs an id returned by your own earlier dispatch.' },
+  });
+  const m = matchCreationRecord(readCreationRecords(), {
+    terminalHandle: terminal_handle,
+    dispatchId: dispatch_id,
+    taskId: task_id,
+    clientKey: ck,
+  });
+  if (!m.ok) return deny(m.code, m.detail);
+  const { record, handle } = m;
+
+  if (coordinatorHandles.has(handle)) {
+    return deny('reclaim_sender_terminal', 'Sender/coordinator terminals are never reclaimable.');
+  }
+  for (const c of senderCaches.values()) {
+    if (c && c.handle === handle) {
+      return deny('reclaim_sender_terminal', 'Sender/coordinator terminals are never reclaimable.');
+    }
+  }
+  for (const [k, reg] of clientOwnership.entries()) {
+    if (k !== ck && reg.workerHandles.has(handle)) {
+      return deny('reclaim_owned_by_other', 'The terminal is owned by another client.');
+    }
+  }
+
+  const listed = await runJson(['terminal', 'list', '--json'], { timeoutMs: 15_000 });
+  if (!envOk(listed)) return deny('reclaim_orca_unavailable', 'Could not list Orca terminals to verify.');
+  const live = verifyLiveTerminal(listed.envelope?.result?.terminals, {
+    handle,
+    worktreePath: record.worktreePath,
+  });
+  if (!live.ok) return deny(live.code, live.detail);
+
+  if (record.dispatchId) {
+    const bound = await bindOwnedDispatch({
+      runId: record.runId,
+      dispatchId: record.dispatchId,
+      terminalHandle: handle,
+      taskId: record.taskId,
+      agent: record.agent,
+      worktree: record.worktreePath,
+      name: record.name,
+      clientKey: ck,
+    });
+    if (!bound.ok) {
+      return deny('reclaim_owned_by_other', 'The dispatch is already bound to another client.');
+    }
+  } else {
+    registerOwnedDispatch({ runId: record.runId, terminalHandle: handle, taskId: record.taskId, clientKey: ck });
+  }
+  return {
+    ok: true,
+    reclaimed: {
+      terminal_handle: handle,
+      dispatch_id: record.dispatchId,
+      run_id: record.runId,
+      task_id: record.taskId,
+      worktree: record.worktreePath,
+      created_at: record.ts,
+      created_stage: record.stage,
+      created_ok: record.ok,
+    },
+    next: {
+      action: record.ok ? 'await_or_release' : 'release',
+      detail: record.ok
+        ? 'Ownership restored. Continue with await, or release when done.'
+        : 'This worker never finished dispatch. Release it with terminalHandle (and taskId).',
+    },
+  };
+}
+
+async function dispatchWorkerInner(args = {}, ctx = {}) {
 
   try {
     await ensureRuntimeReady();
@@ -1580,6 +1742,11 @@ async function dispatchWorker(args = {}) {
   let runId = runIdProvided ? String(args.run_id).trim() : '';
 
   const steps = [];
+  // Local patch: expose to dispatchWorker's creation recorder.
+  ctx.steps = steps;
+  ctx.agent = agent;
+  ctx.name = name || null;
+  ctx.worktreeMode = worktree;
 
   // 1) Run
   if (!runId) {
@@ -1884,6 +2051,8 @@ async function dispatchWorker(args = {}) {
     const wr = wtRes.envelope?.result || {};
     handle =
       pick(wr, 'agentTerminalHandle') ||
+      // Local patch: current Orca puts it at result.launch.outcome.handle (kind: terminal).
+      launchOutcomeTerminalHandle(wr) ||
       pick(wr.startupTerminal, 'handle') ||
       pick(wr, 'handle') ||
       '';
@@ -2504,9 +2673,32 @@ async function releaseWorker(args = {}) {
     releaseRefusesCoordinator,
     coordinatorHandles,
     upsertDispatch: (id, row) => dispatchRegistry.upsert(id, row),
+    // Local patch 8: remove the dispatch's own worktree after the worker closed.
+    cleanupWorktree: (p) => cleanupDispatchWorktree(p, {
+      readCreationRecords,
+      runJson,
+      envOk,
+      git: async (cwd, gitArgs) => {
+        const { stdout } = await execFile(
+          'git',
+          ['-c', 'core.fsmonitor=false', '-C', cwd, ...gitArgs],
+          { timeout: 15_000, maxBuffer: 4 * 1024 * 1024, env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' } },
+        );
+        return String(stdout);
+      },
+    }),
     purgeWorkerCreds: async (opts = {}) => {
       const did = opts.dispatchId != null ? String(opts.dispatchId).trim() : '';
       const out = { ok: true, cap: null, creds: null };
+      // Local patch: with worker isolation off AND no seed helper installed
+      // (macOS), nothing was ever seeded or minted (both happen only under
+      // isolation), and every purge path would fail on sudo. Skip cap + creds.
+      // Hosts with the helper installed (Linux) keep the upstream fail-closed purge.
+      if (!WORKER_ISOLATION.enabled && !fs.existsSync(SEED_HELPER)) {
+        out.cap = did ? { skipped: 'worker_isolation_disabled', dispatchId: did } : null;
+        out.creds = { skipped: 'worker_isolation_disabled' };
+        return out;
+      }
       if (did) {
         try {
           await markWorkerCapPurge(did);
@@ -2549,7 +2741,7 @@ async function releaseWorker(args = {}) {
 const TOOLS = [
   {
     name: 'orca',
-    description: buildToolDescription({ minVersion: MIN_BRIDGE_VERSION }),
+    description: buildToolDescription({ minVersion: MIN_BRIDGE_VERSION, defaultAgent: DEFAULT_AGENT }),
     annotations: { ...ORCA_TOOL_ANNOTATIONS },
     outputSchema: ORCA_OUTPUT_SCHEMA,
     inputSchema: {
@@ -2576,7 +2768,7 @@ const TOOLS = [
             'worker_done contract is auto-appended by the bridge.',
         },
         objective: { type: 'string', description: 'For dispatch: short run objective (defaults to spec head)' },
-        agent: { type: 'string', description: `For dispatch: TUI agent (omp|grok|…); default ${DEFAULT_AGENT}` },
+        agent: { type: 'string', description: `For dispatch: TUI agent (${[DEFAULT_AGENT, ...['claude', 'omp', 'grok'].filter((a) => a !== DEFAULT_AGENT)].join('|')}|…); default ${DEFAULT_AGENT} (ORCA_BRIDGE_DEFAULT_AGENT)` },
         worktree: {
           type: 'string',
           description: 'For dispatch: new-top-level | new-child | current (default new-top-level)',
@@ -2600,6 +2792,13 @@ const TOOLS = [
             'For release (inject path): terminal_handle from dispatch. Preferred cleanup = terminal close --terminal <handle> --json (no --tab).',
         },
         taskId: { type: 'string', description: 'Optional task id for dispatch-show lookup on release' },
+        keepWorktree: {
+          type: 'boolean',
+          description:
+            'For release: true keeps the worktree. Default: after the worker terminal is closed, release removes ' +
+            'the worktree this client\'s dispatch created, only if clean, no commits outside main/remotes, and no other ' +
+            'terminal is open in it (else worktree.state=retained + reason). Main/foreign/current worktrees are never removed.',
+        },
         // await / check
         waitMs: {
           type: 'number',
@@ -2695,7 +2894,7 @@ async function healthPayload({ verbose = false } = {}) {
       workerUid: workerIsolationHealth(WORKER_ISOLATION),
     },
     hindsightTarget: HINDSIGHT_URL.href,
-    actions: ['health', 'dispatch', 'await', 'release', 'guide', 'check', 'cli'],
+    actions: ['health', 'dispatch', 'await', 'release', 'reclaim', 'guide', 'check', 'cli'],
     toolsets: TOOLSET_GATE.snapshot(),
     actionAnnotations: ACTION_ANNOTATIONS,
     audit: {
@@ -2769,6 +2968,7 @@ async function callTool(name, args = {}) {
     else if (action === 'dispatch' || action === 'dispatch_worker') op = 'dispatch';
     else if (action === 'await' || action === 'awaitdispatch' || action === 'await_dispatch') op = 'await';
     else if (action === 'release' || action === 'release_worker') op = 'release';
+    else if (action === 'reclaim' || action === 'reclaim_worker') op = 'reclaim';
     else if (action === 'guide' || action === 'coordinator') op = 'guide';
     else if (action === 'check' || action === 'orca_check') op = 'check';
     else if (action === 'cli' || action === '') {
@@ -2777,7 +2977,7 @@ async function callTool(name, args = {}) {
       else if (!action) op = 'health';
       else op = 'cli';
     } else {
-      throw new Error(`unknown action "${a.action}". Use health|dispatch|await|release|guide|check|cli`);
+      throw new Error(`unknown action "${a.action}". Use health|dispatch|await|release|reclaim|guide|check|cli`);
     }
   }
   // Capability toolset gate (after action resolve, before orch lock).
@@ -2792,7 +2992,7 @@ async function callTool(name, args = {}) {
 
   // Serialize orch mutations per client so parallel dispatch/await of the same
   // coordinator cannot rebind its own sender mid-flight (mechanism A′).
-  const needsOrchLock = op === 'dispatch' || op === 'await' || op === 'release' || op === 'check'
+  const needsOrchLock = op === 'dispatch' || op === 'await' || op === 'release' || op === 'reclaim' || op === 'check'
     || (op === 'cli' && Array.isArray(a.args) && a.args[0] === 'orchestration');
   if (needsOrchLock) {
     return withAbortableLock(
@@ -2837,6 +3037,15 @@ async function callToolUnlocked(op, a) {
 
   if (op === 'release') {
     return releaseWorker({
+      dispatch_id: a.dispatchId,
+      terminal_handle: a.terminalHandle || a.terminal_handle || a.handle,
+      task_id: a.taskId || a.task_id,
+      keep_worktree: a.keepWorktree === true || a.keep_worktree === true,
+    });
+  }
+
+  if (op === 'reclaim') {
+    return reclaimWorker({
       dispatch_id: a.dispatchId,
       terminal_handle: a.terminalHandle || a.terminal_handle || a.handle,
       task_id: a.taskId || a.task_id,
@@ -3092,8 +3301,8 @@ async function handleRpc(msg, { sessionId } = {}) {
           content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
           isError: false,
         };
-        // structuredContent for health + await (outputSchema on tool).
-        if (STRUCTURED_OUTPUT_ACTIONS.has(action) && result && typeof result === 'object') {
+        // outputSchema を宣言しているため、成功結果は structuredContent が必要（mcp-remote 等が -32600 にする）。
+        if (result && typeof result === 'object' && !Array.isArray(result)) {
           payload.structuredContent = result;
         }
         return {

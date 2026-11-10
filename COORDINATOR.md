@@ -10,6 +10,7 @@ Bridge ≥ 0.2.9 returns the same structure via `action=guide`.
 
 ```text
 dispatch → await(≤45s)×N [honor liveness] → worker_done → release(dispatchId, terminalHandle) → read-only
+lost ownership (handle_not_owned) → reclaim(terminalHandle|dispatchId|taskId) → release
 ```
 
 Optional diagnostics (compact default: version, versionOk, statusProbe.ok, defaultRepo, next). Pass verbose:true for full statusProbe/actionAnnotations. Not required before each wave — dispatch/await/release self-diagnose runtime/version failures.
@@ -71,7 +72,7 @@ The bridge **appends** a `worker_done` contract itself. Still spell out in the b
 
 - orchestration reply (questions)
 - skills get, status, worktree show/list
-- terminal list/read/close/send for YOUR keep-list handles only (shell: one `--text … --enter`; TUI compose box: that plus a following empty `--enter`; `--interrupt` to break a stuck TUI; no `--submit`)
+- terminal list/read/send for YOUR keep-list handles only (close via action=release) (shell: one `--text … --enter`; TUI compose box: that plus a following empty `--enter`; `--interrupt` to break a stuck TUI; no `--submit`)
 - worker-show / worker-read on escalation
 
 Not allowed:

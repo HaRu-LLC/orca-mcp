@@ -227,7 +227,7 @@ Cascade → MCP servers → add a stdio server with the **Standard config** fiel
 | `ORCA_BRIDGE_TOKEN` | **yes** (≥16 chars) | Master token — proves the local host may drive the bridge (same secret HTTP mode uses) |
 | `ORCA_CLI_COMMAND` | no | Override `orca` binary (Linux headless often `orca-ide`) |
 | `ORCA_BRIDGE_DEFAULT_REPO` | no | Default `--repo` for `dispatch` |
-| `ORCA_BRIDGE_DEFAULT_AGENT` | no | Default agent (default `omp`) |
+| `ORCA_BRIDGE_DEFAULT_AGENT` | no | Default agent for `dispatch`, e.g. `claude` (unset = `omp`) |
 | `ORCA_BRIDGE_SENDER_TERMINAL` / `ORCA_BRIDGE_FROM` | no | Pin orchestration sender handle |
 | `ORCA_BRIDGE_SENDER_TITLE` | no | Title for auto-created coordinator tabs |
 | `ORCA_BRIDGE_SENDER_SHARED` | no | `1` = single-tenant sender pin |
@@ -357,6 +357,7 @@ Raw `worktree create --agent --prompt` is **rejected** (`forbidden_handoff`). Us
 
 ```text
 dispatch → await(≤45s)×N [honor liveness] → worker_done → release(dispatchId, terminalHandle) → read-only
+lost ownership (handle_not_owned) → reclaim(terminalHandle|dispatchId|taskId) → release
 ```
 
 Runtime/version gates run **lazily** inside `dispatch` / `await` / `release` (self-diagnosing errors). `health` is optional compact diagnostics (`verbose:true` for the full dump).
@@ -377,13 +378,18 @@ Example wave:
 
 ```jsonc
 // 1. start work
-{ "action": "dispatch", "spec": "…", "repo": "path:/path/to/repo", "agent": "omp" }
+// agent defaults to ORCA_BRIDGE_DEFAULT_AGENT (built-in fallback `omp`); e.g. claude | omp | grok
+{ "action": "dispatch", "spec": "…", "repo": "path:/path/to/repo", "agent": "claude" }
 
 // 2. poll until worker_done (repeat; honor liveness on empty)
 { "action": "await", "runId": "<from dispatch>", "waitMs": 45000 }
 
 // 3. cleanup
 { "action": "release", "dispatchId": "<…>", "terminalHandle": "<worker handle from dispatch>" }
+
+// recovery: ownership lost after a bridge restart or a failed dispatch (handle_not_owned)
+{ "action": "reclaim", "taskId": "<task_id from dispatch>" }
+{ "action": "release", "terminalHandle": "<…>", "taskId": "<…>" }
 ```
 <!-- END GENERATED: coordinator-discipline -->
 
@@ -419,7 +425,7 @@ still fails closed (`handle_not_owned` on a foreign handle).
 | `ORCA_BRIDGE_PUBLIC_ORIGIN` | HTTP only. Public origin for OAuth URLs (Funnel / proxy host) |
 | `ORCA_BRIDGE_REDIRECT_ALLOW` | HTTP only. Comma-separated allowed `redirect_uri` prefixes |
 | `ORCA_CLI_COMMAND` | Override `orca` binary (Linux often `orca-ide`) |
-| `ORCA_BRIDGE_DEFAULT_AGENT` | Default agent for `dispatch` (default `omp`) |
+| `ORCA_BRIDGE_DEFAULT_AGENT` | Default agent for `dispatch`, e.g. `claude` (unset = `omp`; must be installed on the Orca host) |
 | `ORCA_BRIDGE_DEFAULT_REPO` | Default `--repo` (`path:…` / `name:…`) |
 | `ORCA_BRIDGE_SENDER_TERMINAL` / `ORCA_BRIDGE_FROM` | Pin a live terminal as orchestration sender |
 | `ORCA_BRIDGE_SENDER_TITLE` | Title for auto-created coordinator tabs |
