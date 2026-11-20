@@ -2,9 +2,15 @@
 
 ## Unreleased
 
-- **Ask output schema.** `run_id` may be null when `action=ask` has no bound run.
-  The mailed subject is the fixed word `質問` so the bot chat does not show the
-  question twice.
+- **Ask reads Orca's binding.** Before sending, `action=ask` calls
+  `orchestration run-current` as the bridge terminal and waits on
+  `run:<that id>`, including a Run bound outside this bridge. When that
+  command cannot be asked, ask peeks the sender terminal and the unscoped
+  inbox, keeping a host-inbox row only when `payload.requestId` is the
+  question id. Replies match `payload.requestId`. `structuredContent` omits
+  keys whose value is null so a client still enforcing `run_id: string`
+  (not required) accepts an unbound ask. The text JSON still includes nulls.
+  The mailed subject is the fixed word `質問`.
 
 - **Ask a bot.** `action=ask` sends one `--type question` to `bot:<name>` and
   peeks the coordinator's bound Run (`--terminal run:<id>`). The send receipt's

@@ -80,12 +80,15 @@ import {
   buildBotQuestionSendArgv,
   buildBotReplyCheckArgv,
   buildBotReplyInboxArgv,
+  buildRunCurrentArgv,
+  parseRunCurrent,
   replyMailboxAddress,
   extractBots,
   findBot,
   sentMessageId,
   messagesFromEnvelope,
   matchBotReply,
+  messageRefersToRequest,
   summarizeMailboxRows,
   dropSeenBotReplies,
   shouldContinueForWorkerDone,
@@ -124,6 +127,7 @@ import {
   ACTION_ANNOTATIONS,
   ORCA_OUTPUT_SCHEMA,
   STRUCTURED_OUTPUT_ACTIONS,
+  omitNullProperties,
   createAuditLog,
   createDispatchRegistry,
   listMcpResources,
@@ -1359,7 +1363,7 @@ async function resolveSenderTerminal({ force = false } = {}) {
  * - mutations: --from <handle>
  * - check: --terminal <handle> (consumer identity; --from is invalid)
  */
-async function withSender(argv, { terminal = null } = {}) {
+async function withSender(argv, { terminal = null, unscopedInbox = false } = {}) {
   if (!Array.isArray(argv) || argv.length < 2) return argv;
   if (argv[0] !== 'orchestration') return argv;
   const sub = argv[1];
@@ -1369,14 +1373,14 @@ async function withSender(argv, { terminal = null } = {}) {
   if (!needsFrom && !needsTerminal) return argv;
 
   const sender = await resolveSenderTerminal();
-  return injectSenderArgv(argv, sender.handle, ORCH_FROM_CMDS, { terminal });
+  return injectSenderArgv(argv, sender.handle, ORCH_FROM_CMDS, { terminal, unscopedInbox });
 }
 
-async function runJson(argv, { timeoutMs, cwd, injectSender = true, terminal = null } = {}) {
+async function runJson(argv, { timeoutMs, cwd, injectSender = true, terminal = null, unscopedInbox = false } = {}) {
   let finalArgv = argv;
   if (injectSender && Array.isArray(argv) && argv[0] === 'orchestration') {
     try {
-      finalArgv = await withSender(argv, { terminal });
+      finalArgv = await withSender(argv, { terminal, unscopedInbox });
     } catch (e) {
       const sub = argv[1];
       if (ORCH_FROM_CMDS.has(sub) || sub === 'check' || sub === 'inbox') {
@@ -2824,6 +2828,7 @@ async function awaitDispatch(args = {}) {
 }
 
 function botReplyTimeout(waitMs, messageId, mailbox) {
+  const mailboxes = Array.isArray(mailbox) ? mailbox : mailbox ? [mailbox] : [];
   return {
     ok: false,
     error: 'reply_timeout',
@@ -2834,7 +2839,7 @@ function botReplyTimeout(waitMs, messageId, mailbox) {
     resent: false,
     consumed: false,
     detail: 'No reply arrived before the wait window. The question was sent once and was not resent.',
-    mailboxes: mailbox ? [mailbox] : [],
+    mailboxes,
   };
 }
 
@@ -2853,11 +2858,13 @@ function botCheckFailed(described, waitMs, mailbox) {
 
 /**
  * One question to bot:<name>. Send once, then peek the reply mailbox.
- * Never consumes. A bound coordinator is read at `--terminal run:<id>`
- * (or `dispatch:<id>`), not at the sender handle.
+ * Never consumes. A Run Orca bound to this terminal is read at
+ * `--terminal run:<id>`. When that binding cannot be asked, also peek the
+ * host inbox for rows whose payload.requestId is the question id.
  */
-async function waitForBotReply({ messageId, botName, waitMs, mailbox, mailboxLabel }) {
+async function waitForBotReply({ messageId, botName, waitMs, mailbox, mailboxLabel, unscoped = false }) {
   const ctx = { messageId, botName };
+  if (unscoped && messageId) return waitForBotReplyUnscoped({ messageId, botName, waitMs, mailboxLabel });
   const deadline = Date.now() + waitMs;
   const watched = {
     terminal: mailboxLabel,
@@ -2931,6 +2938,80 @@ async function waitForBotReply({ messageId, botName, waitMs, mailbox, mailboxLab
   return botReplyTimeout(waitMs, messageId, watched);
 }
 
+/**
+ * run-current could not be asked. Peek the sender terminal and the host inbox.
+ * The host inbox contributes only rows whose payload.requestId is this question.
+ * Neither read marks mail handled. Neither blocks for the whole window, so a
+ * reply in either place is seen on the same poll.
+ */
+async function waitForBotReplyUnscoped({ messageId, botName, waitMs, mailboxLabel }) {
+  const ctx = { messageId, botName };
+  const deadline = Date.now() + Math.max(0, waitMs);
+  const watched = [
+    { terminal: mailboxLabel, rows: [] },
+    { terminal: 'inbox', rows: [] },
+  ];
+  let sawOk = false;
+  let lastFail = null;
+
+  function finish(reply) {
+    const view = answerView(reply);
+    return {
+      ok: true,
+      timedOut: false,
+      window_ms: waitMs,
+      consumed: false,
+      left_in_inbox: true,
+      sent: true,
+      answer: view,
+      text: view?.body || '',
+      mailboxes: watched,
+    };
+  }
+
+  async function peekTerminal() {
+    return runJson(buildBotReplyCheckArgv({ waitMs: 0, mailbox: null }), { timeoutMs: 20_000 });
+  }
+
+  async function peekInbox() {
+    return runJson(buildBotReplyInboxArgv({ limit: 200 }), {
+      timeoutMs: 20_000,
+      unscopedInbox: true,
+    });
+  }
+
+  do {
+    const terminal = await peekTerminal();
+    if (envOk(terminal)) {
+      sawOk = true;
+      const messages = messagesFromEnvelope(terminal.envelope);
+      watched[0].rows = summarizeMailboxRows(messages);
+      const reply = matchBotReply(messages, ctx);
+      if (reply) return finish(reply);
+    } else {
+      lastFail = terminal;
+    }
+
+    const inbox = await peekInbox();
+    if (envOk(inbox)) {
+      sawOk = true;
+      const messages = messagesFromEnvelope(inbox.envelope).filter((row) => messageRefersToRequest(row, messageId));
+      watched[1].rows = summarizeMailboxRows(messages);
+      const reply = matchBotReply(messages, ctx);
+      if (reply) return finish(reply);
+    } else {
+      lastFail = inbox;
+    }
+
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    await sleep(Math.min(BOT_REPLY_POLL_MS, remaining));
+  } while (Date.now() < deadline);
+
+  if (!sawOk && lastFail) return botCheckFailed(lastFail, waitMs, watched[0]);
+  return botReplyTimeout(waitMs, messageId, watched);
+}
+
 async function askBot(args = {}) {
   const typeRejection = rejectNonQuestionType(args.type);
   if (typeRejection) return typeRejection;
@@ -2984,6 +3065,30 @@ async function askBot(args = {}) {
     };
   }
 
+  let sender;
+  try {
+    sender = await resolveSenderTerminal();
+  } catch (e) {
+    return {
+      ok: false,
+      error: 'no_sender_terminal',
+      bot: canonical,
+      to: botAddress(canonical),
+      sent: false,
+      resent: false,
+      detail: String(e?.message || e),
+    };
+  }
+
+  // Orca's binding, not the bridge's memory. A Run bound outside this process
+  // still receives the reply at run:<id>. The bridge's own run-use is visible
+  // here because run-current reads the same terminal.
+  const current = await runJson(buildRunCurrentArgv(), { timeoutMs: 20_000 });
+  const parsed = envOk(current) ? parseRunCurrent(current.envelope) : { asked: false };
+  const boundRunId = parsed.asked ? parsed.runId : null;
+  const mailbox = parsed.asked ? replyMailboxAddress({ boundRunId }) : null;
+  const unscoped = !parsed.asked;
+
   const sent = await runJson(
     buildBotQuestionSendArgv({
       name: canonical,
@@ -3008,31 +3113,13 @@ async function askBot(args = {}) {
 
   const messageId = sentMessageId(sent.envelope);
   const waitMs = clampWaitMs(args.wait_ms);
-  let sender;
-  try {
-    sender = await resolveSenderTerminal();
-  } catch (e) {
-    return {
-      ok: false,
-      error: 'no_sender_terminal',
-      bot: canonical,
-      to: botAddress(canonical),
-      question_id: messageId,
-      sent: true,
-      resent: false,
-      detail: String(e?.message || e),
-    };
-  }
-  const reg = ownershipFor(currentClientKey());
-  const boundRunId = reg.boundRunId && reg.boundSender === sender.handle ? reg.boundRunId : null;
-  // Always the coordinator's bound Run. The send receipt's run/dispatch is the bot's.
-  const mailbox = replyMailboxAddress({ boundRunId });
   const waited = await waitForBotReply({
     messageId,
     botName: canonical,
     waitMs,
     mailbox,
     mailboxLabel: mailbox || sender.handle,
+    unscoped,
   });
   if (waited.ok) {
     rememberSeenBotReply({ replyId: waited.answer?.id });
@@ -3737,7 +3824,9 @@ async function handleRpc(msg, { sessionId } = {}) {
         };
         // outputSchema を宣言しているため、成功結果は structuredContent が必要（mcp-remote 等が -32600 にする）。
         if (result && typeof result === 'object' && !Array.isArray(result)) {
-          payload.structuredContent = result;
+          // Text JSON above keeps nulls. structuredContent drops null keys so a
+          // client still holding run_id: string (not required) accepts the call.
+          payload.structuredContent = omitNullProperties(result);
         }
         return {
           response: rpcResult(id, payload),
