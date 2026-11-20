@@ -88,7 +88,7 @@ Not allowed:
 
 ## Release (inject path)
 
-After inject-path worker_done, dispatch is already settled; worker-release often returns dispatch_not_found. release closes the worker with terminal close --terminal <handle> --json (no --tab). tab_not_found / workspace_session_unavailable means the tab is already gone.
+After inject-path worker_done, dispatch is already settled; worker-release often returns dispatch_not_found. release closes a terminal worker with terminal close --terminal <handle> --json (no --tab). tab_not_found / workspace_session_unavailable means the tab is already gone. A structured chat handle (structured-agent-session-…) is not terminal-closed: worker-release, then worker-stop if that retained. await uses orchestration check --wait, which returns when a matching message arrives.
 
 Pass the **worker** `terminal_handle` from the `dispatch` response, never the
 coordinator sender from `health`.

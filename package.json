@@ -61,6 +61,7 @@
     "lib/worktree-acl.mjs",
     "lib/isolated-git.mjs",
     "lib/agent-tui.mjs",
+    "lib/structured-session.mjs",
     "lib/cli-argv-normalize.mjs",
     "scripts/",
     "docs/",
