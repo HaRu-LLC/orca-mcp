@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **Ask a bot.** `action=ask` sends one `--type question` to `bot:<name>` and waits
+  with `orchestration check --wait` (same window as `await`). The call returns
+  when the reply arrives. `handoff` and any other type are rejected. An unknown
+  bot, a paused bot, or no reply is an error and is not resent. The action is
+  in the `dispatch` toolset.
+
 - **Structured chat sessions.** `dispatch` accepts `launch.outcome.kind=structured`
   (`structured-agent-session-<id>`). The brief, including the `worker_done`
   contract, is mailed to `orca_session_id:<id>` (no `--inject`, no `terminal close`).

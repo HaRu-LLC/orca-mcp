@@ -68,7 +68,27 @@ import {
   replyEnvelopeIsQuestionAnswer,
   isStaleDeliveryError,
   explainStaleDeliveryError,
+  clampWaitMs,
 } from './lib/security-core.mjs';
+import {
+  BOT_REPLY_POLL_MS,
+  rejectNonQuestionType,
+  normalizeBotName,
+  normalizeQuestion,
+  normalizeChat,
+  botAddress,
+  buildBotQuestionSendArgv,
+  buildBotReplyCheckArgv,
+  buildBotReplyInboxArgv,
+  extractBots,
+  findBot,
+  sentMessageId,
+  messagesFromEnvelope,
+  matchBotReply,
+  batchIsOnlyBotReply,
+  answerView,
+  checkTimedOut,
+} from './lib/bot-question.mjs';
 import {
   createCliPolicy,
   resolveCliPolicyConfig,
@@ -2757,6 +2777,217 @@ async function awaitDispatch(args = {}) {
   };
 }
 
+function botReplyTimeout(waitMs, messageId) {
+  return {
+    ok: false,
+    error: 'reply_timeout',
+    timedOut: true,
+    window_ms: waitMs,
+    question_id: messageId || null,
+    sent: true,
+    resent: false,
+    consumed: false,
+    detail: 'No reply arrived before the wait window. The question was sent once and was not resent.',
+  };
+}
+
+function botCheckFailed(described, waitMs) {
+  return {
+    ok: false,
+    error: 'check_failed',
+    timedOut: false,
+    window_ms: waitMs,
+    sent: true,
+    resent: false,
+    detail: described?.envelope?.error?.message || described?.error || 'check failed; the question was not resent.',
+  };
+}
+
+async function consumeBotReply(messages, reply, ctx, runId) {
+  if (!batchIsOnlyBotReply(messages, reply, ctx)) {
+    return { consumed: false, leftInInbox: true };
+  }
+  const described = await runJson(
+    buildBotReplyCheckArgv({ waitMs: 0, peek: false, runId }),
+    { timeoutMs: 20_000 },
+  );
+  // envOk returns the envelope object on success, not a boolean.
+  const consumed = Boolean(envOk(described));
+  return { consumed, leftInInbox: !consumed };
+}
+
+/**
+ * One question to bot:<name>. Send once, then the same check --wait await uses.
+ * Returns when the reply is in the mailbox. Does not resend.
+ */
+async function waitForBotReply({ messageId, botName, waitMs, runId }) {
+  const ctx = { messageId, botName };
+  const deadline = Date.now() + waitMs;
+
+  function finish(reply, { consumed, leftInInbox }) {
+    const view = answerView(reply);
+    return {
+      ok: true,
+      timedOut: false,
+      window_ms: waitMs,
+      consumed: consumed === true,
+      left_in_inbox: leftInInbox === true,
+      sent: true,
+      answer: view,
+      text: view?.body || '',
+    };
+  }
+
+  async function take(messages) {
+    const reply = matchBotReply(messages, ctx);
+    if (!reply) return null;
+    const consumed = await consumeBotReply(messages, reply, ctx, runId);
+    return finish(reply, consumed);
+  }
+
+  if (!(waitMs > 0)) {
+    const described = await runJson(
+      buildBotReplyCheckArgv({ waitMs: 0, peek: true, runId }),
+      { timeoutMs: 20_000 },
+    );
+    if (!envOk(described)) return botCheckFailed(described, waitMs);
+    return (await take(messagesFromEnvelope(described.envelope))) || botReplyTimeout(waitMs, messageId);
+  }
+
+  const described = await runJson(
+    buildBotReplyCheckArgv({ waitMs, peek: true, runId }),
+    { timeoutMs: waitMs + 30_000 },
+  );
+  if (!envOk(described)) return botCheckFailed(described, waitMs);
+  const messages = messagesFromEnvelope(described.envelope);
+  const ready = await take(messages);
+  if (ready) return ready;
+  if (checkTimedOut(described.envelope, messages) || Date.now() >= deadline) {
+    return botReplyTimeout(waitMs, messageId);
+  }
+
+  // Other unread mail woke check at once. Poll inbox until the same deadline
+  // so that mail stays for await, and so a second check --wait does not spin.
+  while (Date.now() < deadline) {
+    const inbox = await runJson(buildBotReplyInboxArgv({ runId }), { timeoutMs: 20_000 });
+    if (envOk(inbox)) {
+      const reply = matchBotReply(messagesFromEnvelope(inbox.envelope), ctx);
+      if (reply) return finish(reply, { consumed: false, leftInInbox: true });
+    }
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    await sleep(Math.min(BOT_REPLY_POLL_MS, remaining));
+  }
+  return botReplyTimeout(waitMs, messageId);
+}
+
+async function askBot(args = {}) {
+  const typeRejection = rejectNonQuestionType(args.type);
+  if (typeRejection) return typeRejection;
+  const named = normalizeBotName(args.bot);
+  if (!named.ok) return named;
+  const asked = normalizeQuestion(args.question);
+  if (!asked.ok) return asked;
+  const chat = normalizeChat(args.chat);
+  if (!chat.ok) return chat;
+
+  try {
+    await ensureRuntimeReady();
+  } catch (e) {
+    return runtimeGuardRejection(e);
+  }
+
+  const listed = await runJson(['bot', 'list', '--json'], { timeoutMs: 20_000 });
+  if (!envOk(listed)) {
+    return {
+      ok: false,
+      error: 'bot_list_failed',
+      sent: false,
+      resent: false,
+      detail: 'Could not list bots, so nothing was sent.',
+      raw: listed.envelope?.error || listed.error || null,
+    };
+  }
+  const bots = extractBots(listed.envelope);
+  const bot = findBot(bots, named.name);
+  if (!bot) {
+    return {
+      ok: false,
+      error: 'bot_not_found',
+      bot: named.name,
+      known: bots.map((b) => b.name).filter(Boolean),
+      sent: false,
+      resent: false,
+      detail: `There is no bot named ${named.name}. Nothing was sent.`,
+    };
+  }
+  const canonical = String(bot.name || named.name);
+  if (bot.paused === true) {
+    return {
+      ok: false,
+      error: 'bot_paused',
+      bot: canonical,
+      to: botAddress(canonical),
+      sent: false,
+      resent: false,
+      detail: `${canonical} is paused. Nothing was sent.`,
+    };
+  }
+
+  const sent = await runJson(
+    buildBotQuestionSendArgv({
+      name: canonical,
+      question: asked.question,
+      chat: chat.chat,
+    }),
+    { timeoutMs: 30_000 },
+  );
+  if (!envOk(sent)) {
+    const code = sent.envelope?.error?.code || 'send_failed';
+    return {
+      ok: false,
+      error: code === 'no_sender_terminal' ? 'no_sender_terminal' : 'send_failed',
+      code,
+      bot: canonical,
+      to: botAddress(canonical),
+      sent: false,
+      resent: false,
+      detail: sent.envelope?.error?.message || sent.error || 'send failed; nothing was resent.',
+    };
+  }
+
+  const messageId = sentMessageId(sent.envelope);
+  const waitMs = clampWaitMs(args.wait_ms);
+  let sender;
+  try {
+    sender = await resolveSenderTerminal();
+  } catch (e) {
+    return {
+      ok: false,
+      error: 'no_sender_terminal',
+      bot: canonical,
+      to: botAddress(canonical),
+      question_id: messageId,
+      sent: true,
+      resent: false,
+      detail: String(e?.message || e),
+    };
+  }
+  const reg = ownershipFor(currentClientKey());
+  const runId = reg.boundRunId && reg.boundSender === sender.handle ? reg.boundRunId : null;
+  const waited = await waitForBotReply({ messageId, botName: canonical, waitMs, runId });
+  return {
+    ...waited,
+    bot: canonical,
+    to: botAddress(canonical),
+    question_id: messageId,
+    chat: chat.chat,
+    sender_handle: sender.handle,
+    run_id: runId,
+    resent: false,
+  };
+}
+
 
 async function releaseWorker(args = {}) {
   try {
@@ -2843,6 +3074,7 @@ async function releaseWorker(args = {}) {
 //   health   — bridge version + orca status + version gate
 //   dispatch — supervised worker start (worker_done path; auto worker_done contract)
 //   await    — one check window (poll until worker_done); empty/timeout = re-call
+//   ask      — one question to bot:<name>; check --wait returns the reply (no handoff)
 //   release  — worker-release OR terminal close (inject path; dispatch_not_found is OK)
 //   guide    — coordinator discipline (waves, brief, devices) — replaces long system prompts
 //   check    — raw orchestration check
@@ -2917,6 +3149,25 @@ const TOOLS = [
         types: { type: 'string', description: `Message types; default ${DEFAULT_WAIT_TYPES}` },
         peek: { type: 'boolean', description: 'Peek without consuming' },
         all: { type: 'boolean', description: 'For check: all messages' },
+        bot: {
+          type: 'string',
+          description:
+            'For ask: bot name (for example "Workspace cleanup"). Sent as --to bot:<name>. Not a worktree or dispatch id.',
+        },
+        question: {
+          type: 'string',
+          description: 'For ask: the question text. Sent once as --type question --body.',
+        },
+        chat: {
+          type: 'string',
+          description:
+            'For ask: optional chat id from `orca bot chats`. Omit to use the bot Home Chat. "new" starts a chat and is still a question.',
+        },
+        type: {
+          type: 'string',
+          description:
+            'For ask: only "question" is accepted. handoff and any other type are rejected and nothing is sent. Omit to send a question.',
+        },
         verbose: {
           type: 'boolean',
           description:
@@ -2946,6 +3197,7 @@ const TOOL_ALIASES = {
   coordinator: 'guide',
   check: 'check',
   orca_check: 'check',
+  ask: 'ask',
 };
 
 function pickArgs(args = {}) {
@@ -3003,7 +3255,7 @@ async function healthPayload({ verbose = false } = {}) {
       workerUid: workerIsolationHealth(WORKER_ISOLATION),
     },
     hindsightTarget: HINDSIGHT_URL.href,
-    actions: ['health', 'dispatch', 'await', 'release', 'reclaim', 'guide', 'check', 'cli'],
+    actions: ['health', 'dispatch', 'await', 'release', 'reclaim', 'ask', 'guide', 'check', 'cli'],
     toolsets: TOOLSET_GATE.snapshot(),
     actionAnnotations: ACTION_ANNOTATIONS,
     audit: {
@@ -3076,6 +3328,7 @@ async function callTool(name, args = {}) {
     if (action === 'health' || action === 'bridge_health') op = 'health';
     else if (action === 'dispatch' || action === 'dispatch_worker') op = 'dispatch';
     else if (action === 'await' || action === 'awaitdispatch' || action === 'await_dispatch') op = 'await';
+    else if (action === 'ask' || action === 'ask_bot') op = 'ask';
     else if (action === 'release' || action === 'release_worker') op = 'release';
     else if (action === 'reclaim' || action === 'reclaim_worker') op = 'reclaim';
     else if (action === 'guide' || action === 'coordinator') op = 'guide';
@@ -3086,7 +3339,7 @@ async function callTool(name, args = {}) {
       else if (!action) op = 'health';
       else op = 'cli';
     } else {
-      throw new Error(`unknown action "${a.action}". Use health|dispatch|await|release|reclaim|guide|check|cli`);
+      throw new Error(`unknown action "${a.action}". Use health|dispatch|await|ask|release|reclaim|guide|check|cli`);
     }
   }
   // Capability toolset gate (after action resolve, before orch lock).
@@ -3101,7 +3354,7 @@ async function callTool(name, args = {}) {
 
   // Serialize orch mutations per client so parallel dispatch/await of the same
   // coordinator cannot rebind its own sender mid-flight (mechanism A′).
-  const needsOrchLock = op === 'dispatch' || op === 'await' || op === 'release' || op === 'reclaim' || op === 'check'
+  const needsOrchLock = op === 'dispatch' || op === 'await' || op === 'ask' || op === 'release' || op === 'reclaim' || op === 'check'
     || (op === 'cli' && Array.isArray(a.args) && a.args[0] === 'orchestration');
   if (needsOrchLock) {
     return withAbortableLock(
@@ -3141,6 +3394,16 @@ async function callToolUnlocked(op, a) {
       ack: a.ack,
       types: a.types,
       peek: a.peek,
+    });
+  }
+
+  if (op === 'ask') {
+    return askBot({
+      bot: a.bot,
+      question: a.question,
+      chat: a.chat,
+      type: a.type,
+      wait_ms: a.waitMs,
     });
   }
 
@@ -3326,6 +3589,7 @@ async function handleRpc(msg, { sessionId } = {}) {
             'Runtime/version self-checked lazily on dispatch/await/release (errors include code+recovery). ' +
             'Empty await carries liveness active|idle|stalled|unknown — re-call while active/idle; stalled → diagnose (peek/ping/release+report). ' +
             'question → cli orchestration reply then await+ack. Prefer summary.status over next.action; honor liveness on empty. ' +
+            'ask {bot, question} sends one --type question to bot:<name> and returns when check --wait sees the reply (same window as await). handoff is rejected and nothing is resent. ' +
             'health = optional compact diagnostics (verbose:true for full dump). guide = waves/brief/devices/stop-conditions. ' +
             'worker_done contract auto-appended on dispatch. ' +
             'Per-OAuth-client sender pin-by-handle (0.2.12+) — no mid-wave recreate; multi-coord safe. ' +

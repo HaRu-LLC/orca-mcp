@@ -387,10 +387,25 @@ Example wave:
 // 3. cleanup
 { "action": "release", "dispatchId": "<…>", "terminalHandle": "<worker handle from dispatch>" }
 
+// ask a bot (question only; the call returns when the reply arrives)
+{ "action": "ask", "bot": "Workspace cleanup", "question": "あなたは何をする bot ですか", "waitMs": 45000 }
+
 // recovery: ownership lost after a bridge restart or a failed dispatch (handle_not_owned)
 { "action": "reclaim", "taskId": "<task_id from dispatch>" }
 { "action": "release", "terminalHandle": "<…>", "taskId": "<…>" }
 ```
+
+## Asking a bot
+
+`action=ask` sends one question to an Orca bot and waits on the same `orchestration check --wait` that `await` uses. It returns when the reply arrives, not at the end of the window. The wait is the same as `await` (default and maximum 45000 ms). The action is in the `dispatch` toolset, so `ORCA_BRIDGE_TOOLSETS=status,dispatch` can call it. It does not need `admin`.
+
+```jsonc
+{ "action": "ask", "bot": "Workspace cleanup", "question": "あなたは何をする bot ですか", "waitMs": 45000 }
+```
+
+Only `--type question` is sent, to `bot:<name>`. `type: "handoff"` and any other type are rejected and nothing is sent. Omit `chat` to land in the bot Home Chat. Pass `chat` with an id from `orca bot chats` to mail that chat (`new` starts a chat and is still a question).
+
+An unknown bot returns `bot_not_found`. A paused bot returns `bot_paused`. No reply before the window ends returns `reply_timeout`. In every one of those cases the question is not sent again (`resent: false`).
 <!-- END GENERATED: coordinator-discipline -->
 
 ### Terminal send — submit with `--enter`
