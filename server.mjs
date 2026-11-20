@@ -88,6 +88,7 @@ import {
   matchBotReply,
   summarizeMailboxRows,
   dropSeenBotReplies,
+  shouldContinueForWorkerDone,
   answerView,
   checkTimedOut,
 } from './lib/bot-question.mjs';
@@ -409,19 +410,23 @@ function markRunBound(runId, senderHandle) {
   reg.boundSender = senderHandle ? String(senderHandle) : null;
 }
 
-/** Replies action=ask already returned. Await drops these so it does not report them again. */
+/**
+ * Reply message ids this process already returned from action=ask.
+ * Not durable: a restart forgets them. Await then reports that reply as a
+ * normal message and reads the following batch so worker_done is not delayed.
+ * Only these ids are omitted — not every row on the question's thread.
+ */
 function seenBotReplies() {
   const reg = ownershipFor(currentClientKey());
   if (!reg.seenBotReplies) {
-    reg.seenBotReplies = { replyIds: new Set(), questionIds: new Set() };
+    reg.seenBotReplies = { replyIds: new Set() };
   }
   return reg.seenBotReplies;
 }
 
-function rememberSeenBotReply({ replyId, questionId } = {}) {
-  const seen = seenBotReplies();
-  if (replyId) seen.replyIds.add(String(replyId));
-  if (questionId) seen.questionIds.add(String(questionId));
+function rememberSeenBotReply({ replyId } = {}) {
+  if (!replyId) return;
+  seenBotReplies().replyIds.add(String(replyId));
 }
 
 function isRunBound(runId, senderHandle) {
@@ -2594,11 +2599,32 @@ async function awaitDispatch(args = {}) {
   }
 
   const res = env.result || env;
-  // Ask only peeks. A reply it already returned stays unread until this check
-  // consumes the delivery. Drop it here so await does not report it again.
-  // Other rows in that delivery (worker_done included) are unchanged.
-  const rawMessages = dropSeenBotReplies(res.messages || [], seenBotReplies());
-  const deliveryId = pick(res, 'deliveryId', 'delivery_id');
+  // A consuming check takes the whole FIFO batch. Ask cannot mark one reply
+  // read, so this check still consumes it. Omit only the reply msg id ask
+  // already returned. If that batch is only the reply or only bot answers,
+  // read the next batch now so worker_done behind it is not delayed. The id
+  // set is in memory; after a restart the reply is reported as a normal message.
+  const seenReplies = seenBotReplies();
+  let lastBatch = res.messages || [];
+  const collected = [...lastBatch];
+  let deliveryId = pick(res, 'deliveryId', 'delivery_id');
+  let followedBotAnswer = false;
+  for (let i = 0; i < 4 && shouldContinueForWorkerDone(lastBatch, seenReplies); i++) {
+    const more = await runJson(
+      ['orchestration', 'check', '--run', runId, '--json', ...(types ? ['--types', types] : [])],
+      { timeoutMs: 20_000 },
+    );
+    if (!envOk(more)) break;
+    const moreRes = more.envelope?.result || more.envelope || {};
+    lastBatch = moreRes.messages || [];
+    if (!lastBatch.length) break;
+    collected.push(...lastBatch);
+    const nextDelivery = pick(moreRes, 'deliveryId', 'delivery_id');
+    if (nextDelivery) deliveryId = nextDelivery;
+    followedBotAnswer = true;
+  }
+  const rawMessages = dropSeenBotReplies(collected, seenReplies);
+  const checkTimedOutFlag = followedBotAnswer ? false : res.timedOut === true;
   const owned = ownershipFor(currentClientKey()).dispatches;
   const { own: messages, foreign: foreignMessages, filtered } = partitionMailbox(
     rawMessages,
@@ -2622,7 +2648,7 @@ async function awaitDispatch(args = {}) {
     summary.status = foreignMessages.length && !messages.length ? 'foreign_only' : summary.status;
   }
   const empty = summary.status === 'empty' || summary.status === 'foreign_only';
-  const effectiveTimedOut = res.timedOut === true || (empty && !deliveryId && !filtered);
+  const effectiveTimedOut = checkTimedOutFlag || (empty && !deliveryId && !filtered);
 
   // --- NAS-240: liveness from dispatch registry + optional terminal activity ---
   const ck = currentClientKey();
@@ -2999,7 +3025,8 @@ async function askBot(args = {}) {
   }
   const reg = ownershipFor(currentClientKey());
   const boundRunId = reg.boundRunId && reg.boundSender === sender.handle ? reg.boundRunId : null;
-  const mailbox = replyMailboxAddress({ boundRunId, sendEnvelope: sent.envelope });
+  // Always the coordinator's bound Run. The send receipt's run/dispatch is the bot's.
+  const mailbox = replyMailboxAddress({ boundRunId });
   const waited = await waitForBotReply({
     messageId,
     botName: canonical,
@@ -3008,7 +3035,7 @@ async function askBot(args = {}) {
     mailboxLabel: mailbox || sender.handle,
   });
   if (waited.ok) {
-    rememberSeenBotReply({ replyId: waited.answer?.id, questionId: messageId });
+    rememberSeenBotReply({ replyId: waited.answer?.id });
   }
   return {
     ...waited,

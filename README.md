@@ -405,9 +405,9 @@ Example wave:
 
 Only `--type question` is sent, to `bot:<name>`. Subject and body use `--subject=<text>` and `--body=<text>`, so a question that starts with `--` is still one value. `type: "handoff"` and any other type are rejected and nothing is sent. Omit `chat` to land in the bot Home Chat. Pass `chat` with an id from `orca bot chats` to mail that chat (`new` starts a chat and is still a question).
 
-A sender already bound to a run reads the reply at `--terminal run:<run_id>` (or `dispatch:<id>` when the send receipt names that mailbox). `--terminal <sender handle>` does not see that mail. An unbound sender reads its own terminal mailbox.
+A sender already bound to a run always reads `--terminal run:<that run id>` (the coordinator's Run). The send receipt's `to` / `run_id` is the bot's own mailbox and is ignored. `--terminal <sender handle>` does not see the Run mailbox. An unbound sender reads its own terminal.
 
-Ask never marks mail handled. A later `await` drops a reply this client already received from `ask`, so the same answer is not reported twice. Other messages in that delivery, including `worker_done`, are still reported. Await's own check may consume the leftover reply row; the summary will not treat it as a new question.
+Ask never marks mail handled. Orca's consuming check takes a whole FIFO batch, so one reply cannot be marked read by itself. A later `await` omits only the reply message id `ask` returned. Other rows on that thread (a follow-up, an unanswered notice) are still reported. The id list lives in the bridge process. After a restart the next `await` reports that reply as a normal message. When the batch is only that bot answer, the same `await` reads the following batch, so a `worker_done` behind it is not delayed by another window.
 
 An unknown bot returns `bot_not_found`. A paused bot returns `bot_paused`. No reply before the window ends returns `reply_timeout`, including `mailboxes[].terminal` and a short `rows` summary (`type`, `from`, `request_id`, `thread_id`, truncated `body`). In every one of those cases the question is not sent again (`resent: false`).
 <!-- END GENERATED: coordinator-discipline -->

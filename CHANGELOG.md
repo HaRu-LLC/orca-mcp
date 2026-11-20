@@ -3,11 +3,12 @@
 ## Unreleased
 
 - **Ask a bot.** `action=ask` sends one `--type question` to `bot:<name>` and
-  peeks the reply mailbox (`--terminal run:<id>` or `dispatch:<id>` when the
-  sender is bound; the sender handle does not see that mail). It does not
-  consume. A later `await` omits a reply `ask` already returned. `reply_timeout`
-  names the mailbox and a short row summary. `handoff` is rejected and nothing
-  is resent. The action is in the `dispatch` toolset.
+  peeks the coordinator's bound Run (`--terminal run:<id>`). The send receipt's
+  run or dispatch is the bot's mailbox and is not used. Ask does not consume.
+  A later `await` omits only that reply's message id. After a restart the reply
+  is a normal message, and the same await reads the next batch so `worker_done`
+  behind a bot answer is not delayed. `handoff` is rejected. The action is in
+  the `dispatch` toolset.
 
 - **Structured chat sessions.** `dispatch` accepts `launch.outcome.kind=structured`
   (`structured-agent-session-<id>`). The brief, including the `worker_done`
