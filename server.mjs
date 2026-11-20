@@ -164,12 +164,16 @@ import {
 import { hardenIsolatedWorktree, inferExpectedGitdir } from './lib/worktree-acl.mjs';
 import {
   buildCreationRecord,
-  launchOutcomeTerminalHandle,
   mayAddListedHandles,
   parseCreationRecords,
   matchCreationRecord,
   verifyLiveTerminal,
+  verifyLiveStructuredSession,
 } from './lib/creation-records.mjs';
+import {
+  isStructuredSessionHandle,
+  readLaunchPlacement,
+} from './lib/structured-session.mjs';
 
 const execFile = promisify(execFileCb);
 
@@ -1573,20 +1577,23 @@ async function markWorkerCapPurge(dispatchId) {
 async function dispatchWorker(args = {}) {
   // Local patch: whatever stage dispatch ends at, record what it created so a
   // lost (restart) or never-bound (mid-dispatch failure) worker can be reclaimed.
-  const ctx = {};
+  // flush() writes that record as soon as a worktree or handle exists, before
+  // place-agent returns and before later stages (bind, inject) can fail.
   const clientKey = currentClientKey();
+  const ctx = { args, clientKey };
+  ctx.flush = (partial) => recordCreation({
+    steps: ctx.steps,
+    result: partial,
+    args: { ...args, agent: ctx.agent, name: ctx.name, worktree: ctx.worktreeMode },
+    clientKey,
+  });
   let result;
   try {
     result = await dispatchWorkerInner(args, ctx);
     return result;
   } finally {
     try {
-      await recordCreation({
-        steps: ctx.steps,
-        result,
-        args: { ...args, agent: ctx.agent, name: ctx.name, worktree: ctx.worktreeMode },
-        clientKey,
-      });
+      await ctx.flush(result);
     } catch (e) {
       console.error('WARN: cannot write creation record:', e?.message || e);
     }
@@ -1669,12 +1676,24 @@ async function reclaimWorker({ terminal_handle, dispatch_id, task_id } = {}) {
     }
   }
 
-  const listed = await runJson(['terminal', 'list', '--json'], { timeoutMs: 15_000 });
-  if (!envOk(listed)) return deny('reclaim_orca_unavailable', 'Could not list Orca terminals to verify.');
-  const live = verifyLiveTerminal(listed.envelope?.result?.terminals, {
-    handle,
-    worktreePath: record.worktreePath,
-  });
+  const structuredSession = isStructuredSessionHandle(handle) || record.sessionKind === 'structured';
+  let live;
+  if (structuredSession) {
+    const listed = await runJson(['agent', 'list', '--json'], { timeoutMs: 15_000 });
+    if (!envOk(listed)) return deny('reclaim_orca_unavailable', 'Could not list Orca agents to verify the chat session.');
+    live = verifyLiveStructuredSession(listed.envelope?.result?.agents, {
+      handle,
+      sessionId: record.sessionId,
+      worktreePath: record.worktreePath,
+    });
+  } else {
+    const listed = await runJson(['terminal', 'list', '--json'], { timeoutMs: 15_000 });
+    if (!envOk(listed)) return deny('reclaim_orca_unavailable', 'Could not list Orca terminals to verify.');
+    live = verifyLiveTerminal(listed.envelope?.result?.terminals, {
+      handle,
+      worktreePath: record.worktreePath,
+    });
+  }
   if (!live.ok) return deny(live.code, live.detail);
 
   if (record.dispatchId) {
@@ -1839,6 +1858,8 @@ async function dispatchWorkerInner(args = {}, ctx = {}) {
   let worktreePath = null;
   let worktreeId = null;
   let workerLaunchCommand = null;
+  let sessionKind = 'terminal';
+  let mailAddress = '';
 
   const isolationPlan = planIsolatedAgentPlacement(
     {
@@ -2049,18 +2070,43 @@ async function dispatchWorkerInner(args = {}, ctx = {}) {
       };
     }
     const wr = wtRes.envelope?.result || {};
-    handle =
-      pick(wr, 'agentTerminalHandle') ||
-      // Local patch: current Orca puts it at result.launch.outcome.handle (kind: terminal).
-      launchOutcomeTerminalHandle(wr) ||
-      pick(wr.startupTerminal, 'handle') ||
-      pick(wr, 'handle') ||
-      '';
+    const placement = readLaunchPlacement(wr);
+    // kind "structured" is a chat tab (handle structured-agent-session-<id>),
+    // not a PTY. Do not fall through to a worktree id in result.handle.
+    if (placement.kind === 'structured') {
+      sessionKind = 'structured';
+      handle = placement.handle;
+      mailAddress = placement.mailAddress || placement.handle;
+    } else {
+      handle =
+        pick(wr, 'agentTerminalHandle') ||
+        (placement.kind === 'terminal' ? placement.handle : '') ||
+        pick(wr.startupTerminal, 'handle') ||
+        pick(wr, 'handle') ||
+        '';
+    }
     worktreePath = pick(wr, 'path') || pick(wr.worktree, 'path') || null;
     worktreeId = pick(wr, 'id') || null;
   }
 
-    if (!handle) {
+  // Persist before place-agent fails and before bind/inject, so a lost worker
+  // is reclaimable even when this call never returns ok.
+  if (typeof ctx.flush === 'function' && (handle || worktreePath)) {
+    try {
+      await ctx.flush({
+        ok: false,
+        stage: handle ? 'placed' : 'place-agent',
+        run_id: runId,
+        task_id: taskId,
+        terminal_handle: handle || null,
+        worktree: worktreePath,
+      });
+    } catch (e) {
+      console.error('WARN: cannot write creation record:', e?.message || e);
+    }
+  }
+
+  if (!handle) {
     return {
       ok: false,
       stage: 'place-agent',
@@ -2072,6 +2118,8 @@ async function dispatchWorkerInner(args = {}, ctx = {}) {
   }
 
   const isolated = isolationPlan.mode === 'isolated-command';
+  const structured = sessionKind === 'structured';
+  const deliverTo = mailAddress || handle;
 
   // Isolated: bind dispatch BEFORE grok starts so we have a real dispatchId
   // to name /run/orca-mcp/worker-caps/<dispatchId>.json. The wrapper is
@@ -2085,6 +2133,14 @@ async function dispatchWorkerInner(args = {}, ctx = {}) {
       { timeoutMs: 60_000 },
     );
     steps.push({ step: 'dispatch-bind', isolated: true, ...dispRes });
+  } else if (structured) {
+    // --inject types into a terminal and is refused when no agent process is
+    // there. Bind the task, then deliver the brief as chat mail.
+    dispRes = await runJson(
+      ['orchestration', 'dispatch', '--task', taskId, '--to', deliverTo, '--return-preamble', '--json'],
+      { timeoutMs: 60_000 },
+    );
+    steps.push({ step: 'dispatch-bind', structured: true, to: deliverTo, ...dispRes });
   } else {
     waitRes = await runJson(
       ['terminal', 'wait', '--terminal', handle, '--for', 'tui-idle', '--timeout-ms', '60000', '--json'],
@@ -2110,12 +2166,13 @@ async function dispatchWorkerInner(args = {}, ctx = {}) {
   if (!envOk(dispRes)) {
     return {
       ok: false,
-      stage: isolated ? 'dispatch-bind' : 'dispatch-inject',
+      stage: isolated || structured ? 'dispatch-bind' : 'dispatch-inject',
       run_id: runId,
       task_id: taskId,
       terminal_handle: handle,
       worktree: worktreePath,
-      error: isolated ? 'dispatch (pre-inject bind) failed' : 'dispatch --inject failed',
+      session_kind: structured ? 'structured' : 'terminal',
+      error: isolated || structured ? 'dispatch (pre-inject bind) failed' : 'dispatch --inject failed',
       steps,
     };
   }
@@ -2123,6 +2180,46 @@ async function dispatchWorkerInner(args = {}, ctx = {}) {
   const dr = dispRes.envelope?.result || {};
   const dispatchId = pick(dr.dispatch, 'id') || pick(dr, 'dispatchId', 'dispatch_id');
   const dispatchPreamble = pick(dr, 'preamble') || '';
+
+  if (structured) {
+    // Preamble is the runtime's task text when present. Always include the
+    // bridge worker_done contract (already on `spec`) so the chat receives it.
+    const brief = dispatchPreamble && String(dispatchPreamble).includes(WORKER_CONTRACT_MARKER)
+      ? String(dispatchPreamble)
+      : (dispatchPreamble ? `${dispatchPreamble}\n\n${spec}` : spec);
+    const sendArgv = [
+      'orchestration', 'send',
+      '--to', deliverTo,
+      '--type', 'dispatch',
+      '--subject', 'worker brief',
+      '--body', brief,
+      '--task-id', taskId,
+    ];
+    if (dispatchId) sendArgv.push('--dispatch-id', String(dispatchId));
+    sendArgv.push('--json');
+    const sendRes = await runJson(sendArgv, { timeoutMs: 60_000 });
+    steps.push({
+      step: 'spec-deliver',
+      ok: envOk(sendRes),
+      to: deliverTo,
+      bytes: brief.length,
+    });
+    if (!envOk(sendRes)) {
+      return {
+        ok: false,
+        stage: 'spec-deliver',
+        run_id: runId,
+        task_id: taskId,
+        dispatch_id: dispatchId || null,
+        terminal_handle: handle,
+        worktree: worktreePath,
+        session_kind: 'structured',
+        mail_address: deliverTo,
+        error: 'could not deliver spec to the structured session',
+        steps,
+      };
+    }
+  }
 
   // 6) Mint worker capability to a 994:994 0600 file (NAS-258).
   // workerCapabilityEnv() is invoked inside mintAndInstallWorkerCap.
@@ -2193,9 +2290,12 @@ async function dispatchWorkerInner(args = {}, ctx = {}) {
     }
   }
 
-  // Skip only if ORCA_BRIDGE_INJECT_RECOVERY=0
+  // Structured chats have no TUI to retype into. Terminal path keeps inject recovery.
+  // Skip also if ORCA_BRIDGE_INJECT_RECOVERY=0.
   let injectRecovery = { recovered: false, landed: true, probes: [], skipped: false };
-  if (process.env.ORCA_BRIDGE_INJECT_RECOVERY === '0') {
+  if (structured) {
+    injectRecovery = { recovered: false, landed: true, probes: [], skipped: true, structured: true };
+  } else if (process.env.ORCA_BRIDGE_INJECT_RECOVERY === '0') {
     injectRecovery = { recovered: false, landed: null, probes: [], skipped: true };
   } else {
     try {
@@ -2241,6 +2341,7 @@ async function dispatchWorkerInner(args = {}, ctx = {}) {
     extra: {
       workerIsolation: isolationPlan.mode === 'isolated-command',
       workerCapabilityMinted: Boolean(workerCapability),
+      sessionKind: structured ? 'structured' : 'terminal',
     },
   });
 
@@ -2256,6 +2357,8 @@ async function dispatchWorkerInner(args = {}, ctx = {}) {
     name: name || null,
     repo: repo || null,
     terminal_handle: handle,
+    session_kind: structured ? 'structured' : 'terminal',
+    mail_address: structured ? deliverTo : undefined,
     worktree: worktreePath,
     worktree_id: worktreeId,
     injected: dr.injected === true,
@@ -2271,8 +2374,12 @@ async function dispatchWorkerInner(args = {}, ctx = {}) {
     next: {
       action: 'await',
       detail:
-        'Poll: orca { action:"await", runId, waitMs:45000 }. Empty/timeout = continue. ' +
+        'Poll: orca { action:"await", runId, waitMs:45000 }. ' +
+        'orchestration check --wait returns when a matching message arrives, not at the end of the window. ' +
         'worker_done -> orca { action:"release", dispatchId, terminalHandle }. ' +
+        (structured
+          ? 'This worker is a structured chat session. Spec was sent as orchestration mail to mail_address. Release does not terminal-close that handle. '
+          : '') +
         'If inject_recovered=true, prompt was re-sent via terminal send --text … --enter plus a following empty --enter (Grok TUI draft buffer). ' +
         'Stuck TUI: terminal send --interrupt on the worker handle.',
       run_id: runId,
@@ -2490,7 +2597,9 @@ async function awaitDispatch(args = {}) {
 
   let terminalLastOutputAt = null;
   let terminalProbe = null;
-  if (empty && primaryEntry?.terminalHandle) {
+  // A chat handle is not a PTY. terminal show/read would fail and hold the
+  // await after check --wait already returned.
+  if (empty && primaryEntry?.terminalHandle && !isStructuredSessionHandle(primaryEntry.terminalHandle)) {
     try {
       const snap = await terminalSnapshot(primaryEntry.terminalHandle);
       terminalProbe = {

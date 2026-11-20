@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- **Structured chat sessions.** `dispatch` accepts `launch.outcome.kind=structured`
+  (`structured-agent-session-<id>`). The brief, including the `worker_done`
+  contract, is mailed to `orca_session_id:<id>` (no `--inject`, no `terminal close`).
+  Creation records are written before place-agent returns, so a failed dispatch
+  can be reclaimed. `await` still uses `orchestration check --wait`, which returns
+  when a matching message arrives.
+
 ## 0.3.6 — 2026-08-15
 
 ### Added
