@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **Ask output schema.** `run_id` may be null when `action=ask` has no bound run.
+  The mailed subject is the fixed word `質問` so the bot chat does not show the
+  question twice.
+
 - **Ask a bot.** `action=ask` sends one `--type question` to `bot:<name>` and
   peeks the coordinator's bound Run (`--terminal run:<id>`). The send receipt's
   run or dispatch is the bot's mailbox and is not used. Ask does not consume.

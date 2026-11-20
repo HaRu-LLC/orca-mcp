@@ -403,7 +403,7 @@ Example wave:
 { "action": "ask", "bot": "Workspace cleanup", "question": "あなたは何をする bot ですか", "waitMs": 45000 }
 ```
 
-Only `--type question` is sent, to `bot:<name>`. Subject and body use `--subject=<text>` and `--body=<text>`, so a question that starts with `--` is still one value. `type: "handoff"` and any other type are rejected and nothing is sent. Omit `chat` to land in the bot Home Chat. Pass `chat` with an id from `orca bot chats` to mail that chat (`new` starts a chat and is still a question).
+Only `--type question` is sent, to `bot:<name>`. The subject is the fixed word `質問`, so the bot chat does not show the question twice. The body is the question, sent as `--body=<text>` so a question that starts with `--` is still one value. `type: "handoff"` and any other type are rejected and nothing is sent. Omit `chat` to land in the bot Home Chat. Pass `chat` with an id from `orca bot chats` to mail that chat (`new` starts a chat and is still a question).
 
 A sender already bound to a run always reads `--terminal run:<that run id>` (the coordinator's Run). The send receipt's `to` / `run_id` is the bot's own mailbox and is ignored. `--terminal <sender handle>` does not see the Run mailbox. An unbound sender reads its own terminal.
 
