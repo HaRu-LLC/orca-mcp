@@ -68,7 +68,30 @@ import {
   replyEnvelopeIsQuestionAnswer,
   isStaleDeliveryError,
   explainStaleDeliveryError,
+  clampWaitMs,
 } from './lib/security-core.mjs';
+import {
+  BOT_REPLY_POLL_MS,
+  rejectNonQuestionType,
+  normalizeBotName,
+  normalizeQuestion,
+  normalizeChat,
+  botAddress,
+  buildBotQuestionSendArgv,
+  buildBotReplyCheckArgv,
+  buildBotReplyInboxArgv,
+  replyMailboxAddress,
+  extractBots,
+  findBot,
+  sentMessageId,
+  messagesFromEnvelope,
+  matchBotReply,
+  summarizeMailboxRows,
+  dropSeenBotReplies,
+  shouldContinueForWorkerDone,
+  answerView,
+  checkTimedOut,
+} from './lib/bot-question.mjs';
 import {
   createCliPolicy,
   resolveCliPolicyConfig,
@@ -385,6 +408,25 @@ function markRunBound(runId, senderHandle) {
   const reg = ownershipFor(currentClientKey());
   reg.boundRunId = runId ? String(runId) : null;
   reg.boundSender = senderHandle ? String(senderHandle) : null;
+}
+
+/**
+ * Reply message ids this process already returned from action=ask.
+ * Not durable: a restart forgets them. Await then reports that reply as a
+ * normal message and reads the following batch so worker_done is not delayed.
+ * Only these ids are omitted — not every row on the question's thread.
+ */
+function seenBotReplies() {
+  const reg = ownershipFor(currentClientKey());
+  if (!reg.seenBotReplies) {
+    reg.seenBotReplies = { replyIds: new Set() };
+  }
+  return reg.seenBotReplies;
+}
+
+function rememberSeenBotReply({ replyId } = {}) {
+  if (!replyId) return;
+  seenBotReplies().replyIds.add(String(replyId));
 }
 
 function isRunBound(runId, senderHandle) {
@@ -1317,7 +1359,7 @@ async function resolveSenderTerminal({ force = false } = {}) {
  * - mutations: --from <handle>
  * - check: --terminal <handle> (consumer identity; --from is invalid)
  */
-async function withSender(argv) {
+async function withSender(argv, { terminal = null } = {}) {
   if (!Array.isArray(argv) || argv.length < 2) return argv;
   if (argv[0] !== 'orchestration') return argv;
   const sub = argv[1];
@@ -1327,14 +1369,14 @@ async function withSender(argv) {
   if (!needsFrom && !needsTerminal) return argv;
 
   const sender = await resolveSenderTerminal();
-  return injectSenderArgv(argv, sender.handle);
+  return injectSenderArgv(argv, sender.handle, ORCH_FROM_CMDS, { terminal });
 }
 
-async function runJson(argv, { timeoutMs, cwd, injectSender = true } = {}) {
+async function runJson(argv, { timeoutMs, cwd, injectSender = true, terminal = null } = {}) {
   let finalArgv = argv;
   if (injectSender && Array.isArray(argv) && argv[0] === 'orchestration') {
     try {
-      finalArgv = await withSender(argv);
+      finalArgv = await withSender(argv, { terminal });
     } catch (e) {
       const sub = argv[1];
       if (ORCH_FROM_CMDS.has(sub) || sub === 'check' || sub === 'inbox') {
@@ -2557,8 +2599,32 @@ async function awaitDispatch(args = {}) {
   }
 
   const res = env.result || env;
-  const rawMessages = res.messages || [];
-  const deliveryId = pick(res, 'deliveryId', 'delivery_id');
+  // A consuming check takes the whole FIFO batch. Ask cannot mark one reply
+  // read, so this check still consumes it. Omit only the reply msg id ask
+  // already returned. If that batch is only the reply or only bot answers,
+  // read the next batch now so worker_done behind it is not delayed. The id
+  // set is in memory; after a restart the reply is reported as a normal message.
+  const seenReplies = seenBotReplies();
+  let lastBatch = res.messages || [];
+  const collected = [...lastBatch];
+  let deliveryId = pick(res, 'deliveryId', 'delivery_id');
+  let followedBotAnswer = false;
+  for (let i = 0; i < 4 && shouldContinueForWorkerDone(lastBatch, seenReplies); i++) {
+    const more = await runJson(
+      ['orchestration', 'check', '--run', runId, '--json', ...(types ? ['--types', types] : [])],
+      { timeoutMs: 20_000 },
+    );
+    if (!envOk(more)) break;
+    const moreRes = more.envelope?.result || more.envelope || {};
+    lastBatch = moreRes.messages || [];
+    if (!lastBatch.length) break;
+    collected.push(...lastBatch);
+    const nextDelivery = pick(moreRes, 'deliveryId', 'delivery_id');
+    if (nextDelivery) deliveryId = nextDelivery;
+    followedBotAnswer = true;
+  }
+  const rawMessages = dropSeenBotReplies(collected, seenReplies);
+  const checkTimedOutFlag = followedBotAnswer ? false : res.timedOut === true;
   const owned = ownershipFor(currentClientKey()).dispatches;
   const { own: messages, foreign: foreignMessages, filtered } = partitionMailbox(
     rawMessages,
@@ -2582,7 +2648,7 @@ async function awaitDispatch(args = {}) {
     summary.status = foreignMessages.length && !messages.length ? 'foreign_only' : summary.status;
   }
   const empty = summary.status === 'empty' || summary.status === 'foreign_only';
-  const effectiveTimedOut = res.timedOut === true || (empty && !deliveryId && !filtered);
+  const effectiveTimedOut = checkTimedOutFlag || (empty && !deliveryId && !filtered);
 
   // --- NAS-240: liveness from dispatch registry + optional terminal activity ---
   const ck = currentClientKey();
@@ -2757,6 +2823,232 @@ async function awaitDispatch(args = {}) {
   };
 }
 
+function botReplyTimeout(waitMs, messageId, mailbox) {
+  return {
+    ok: false,
+    error: 'reply_timeout',
+    timedOut: true,
+    window_ms: waitMs,
+    question_id: messageId || null,
+    sent: true,
+    resent: false,
+    consumed: false,
+    detail: 'No reply arrived before the wait window. The question was sent once and was not resent.',
+    mailboxes: mailbox ? [mailbox] : [],
+  };
+}
+
+function botCheckFailed(described, waitMs, mailbox) {
+  return {
+    ok: false,
+    error: 'check_failed',
+    timedOut: false,
+    window_ms: waitMs,
+    sent: true,
+    resent: false,
+    mailboxes: mailbox ? [mailbox] : [],
+    detail: described?.envelope?.error?.message || described?.error || 'check failed; the question was not resent.',
+  };
+}
+
+/**
+ * One question to bot:<name>. Send once, then peek the reply mailbox.
+ * Never consumes. A bound coordinator is read at `--terminal run:<id>`
+ * (or `dispatch:<id>`), not at the sender handle.
+ */
+async function waitForBotReply({ messageId, botName, waitMs, mailbox, mailboxLabel }) {
+  const ctx = { messageId, botName };
+  const deadline = Date.now() + waitMs;
+  const watched = {
+    terminal: mailboxLabel,
+    rows: [],
+  };
+
+  function note(envelope) {
+    const messages = messagesFromEnvelope(envelope);
+    watched.rows = summarizeMailboxRows(messages);
+    return messages;
+  }
+
+  function finish(reply) {
+    const view = answerView(reply);
+    return {
+      ok: true,
+      timedOut: false,
+      window_ms: waitMs,
+      consumed: false,
+      left_in_inbox: true,
+      sent: true,
+      answer: view,
+      text: view?.body || '',
+      mailboxes: [watched],
+    };
+  }
+
+  const runOpts = { terminal: mailbox || null };
+
+  async function peek(ms) {
+    return runJson(buildBotReplyCheckArgv({ waitMs: ms, mailbox }), {
+      timeoutMs: (ms > 0 ? ms : 0) + 30_000,
+      ...runOpts,
+    });
+  }
+
+  if (!(waitMs > 0)) {
+    const described = await peek(0);
+    if (!envOk(described)) return botCheckFailed(described, waitMs, watched);
+    const messages = note(described.envelope);
+    const reply = matchBotReply(messages, ctx);
+    return reply ? finish(reply) : botReplyTimeout(waitMs, messageId, watched);
+  }
+
+  const described = await peek(waitMs);
+  if (!envOk(described)) return botCheckFailed(described, waitMs, watched);
+  const messages = note(described.envelope);
+  const reply = matchBotReply(messages, ctx);
+  if (reply) return finish(reply);
+  if (checkTimedOut(described.envelope, messages) || Date.now() >= deadline) {
+    return botReplyTimeout(waitMs, messageId, watched);
+  }
+
+  // Unrelated unread woke the peek immediately. Keep reading the same mailbox
+  // with inbox (also non-consuming) until the deadline. Do not check again:
+  // a second --wait would return the same unread at once.
+  while (Date.now() < deadline) {
+    const inbox = await runJson(buildBotReplyInboxArgv({ mailbox }), {
+      timeoutMs: 20_000,
+      ...runOpts,
+    });
+    if (envOk(inbox)) {
+      const rows = note(inbox.envelope);
+      const found = matchBotReply(rows, ctx);
+      if (found) return finish(found);
+    }
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    await sleep(Math.min(BOT_REPLY_POLL_MS, remaining));
+  }
+  return botReplyTimeout(waitMs, messageId, watched);
+}
+
+async function askBot(args = {}) {
+  const typeRejection = rejectNonQuestionType(args.type);
+  if (typeRejection) return typeRejection;
+  const named = normalizeBotName(args.bot);
+  if (!named.ok) return named;
+  const asked = normalizeQuestion(args.question);
+  if (!asked.ok) return asked;
+  const chat = normalizeChat(args.chat);
+  if (!chat.ok) return chat;
+
+  try {
+    await ensureRuntimeReady();
+  } catch (e) {
+    return runtimeGuardRejection(e);
+  }
+
+  const listed = await runJson(['bot', 'list', '--json'], { timeoutMs: 20_000 });
+  if (!envOk(listed)) {
+    return {
+      ok: false,
+      error: 'bot_list_failed',
+      sent: false,
+      resent: false,
+      detail: 'Could not list bots, so nothing was sent.',
+      raw: listed.envelope?.error || listed.error || null,
+    };
+  }
+  const bots = extractBots(listed.envelope);
+  const bot = findBot(bots, named.name);
+  if (!bot) {
+    return {
+      ok: false,
+      error: 'bot_not_found',
+      bot: named.name,
+      known: bots.map((b) => b.name).filter(Boolean),
+      sent: false,
+      resent: false,
+      detail: `There is no bot named ${named.name}. Nothing was sent.`,
+    };
+  }
+  const canonical = String(bot.name || named.name);
+  if (bot.paused === true) {
+    return {
+      ok: false,
+      error: 'bot_paused',
+      bot: canonical,
+      to: botAddress(canonical),
+      sent: false,
+      resent: false,
+      detail: `${canonical} is paused. Nothing was sent.`,
+    };
+  }
+
+  const sent = await runJson(
+    buildBotQuestionSendArgv({
+      name: canonical,
+      question: asked.question,
+      chat: chat.chat,
+    }),
+    { timeoutMs: 30_000 },
+  );
+  if (!envOk(sent)) {
+    const code = sent.envelope?.error?.code || 'send_failed';
+    return {
+      ok: false,
+      error: code === 'no_sender_terminal' ? 'no_sender_terminal' : 'send_failed',
+      code,
+      bot: canonical,
+      to: botAddress(canonical),
+      sent: false,
+      resent: false,
+      detail: sent.envelope?.error?.message || sent.error || 'send failed; nothing was resent.',
+    };
+  }
+
+  const messageId = sentMessageId(sent.envelope);
+  const waitMs = clampWaitMs(args.wait_ms);
+  let sender;
+  try {
+    sender = await resolveSenderTerminal();
+  } catch (e) {
+    return {
+      ok: false,
+      error: 'no_sender_terminal',
+      bot: canonical,
+      to: botAddress(canonical),
+      question_id: messageId,
+      sent: true,
+      resent: false,
+      detail: String(e?.message || e),
+    };
+  }
+  const reg = ownershipFor(currentClientKey());
+  const boundRunId = reg.boundRunId && reg.boundSender === sender.handle ? reg.boundRunId : null;
+  // Always the coordinator's bound Run. The send receipt's run/dispatch is the bot's.
+  const mailbox = replyMailboxAddress({ boundRunId });
+  const waited = await waitForBotReply({
+    messageId,
+    botName: canonical,
+    waitMs,
+    mailbox,
+    mailboxLabel: mailbox || sender.handle,
+  });
+  if (waited.ok) {
+    rememberSeenBotReply({ replyId: waited.answer?.id });
+  }
+  return {
+    ...waited,
+    bot: canonical,
+    to: botAddress(canonical),
+    question_id: messageId,
+    chat: chat.chat,
+    sender_handle: sender.handle,
+    run_id: boundRunId,
+    resent: false,
+  };
+}
+
 
 async function releaseWorker(args = {}) {
   try {
@@ -2843,6 +3135,7 @@ async function releaseWorker(args = {}) {
 //   health   — bridge version + orca status + version gate
 //   dispatch — supervised worker start (worker_done path; auto worker_done contract)
 //   await    — one check window (poll until worker_done); empty/timeout = re-call
+//   ask      — one question to bot:<name>; check --wait returns the reply (no handoff)
 //   release  — worker-release OR terminal close (inject path; dispatch_not_found is OK)
 //   guide    — coordinator discipline (waves, brief, devices) — replaces long system prompts
 //   check    — raw orchestration check
@@ -2917,6 +3210,25 @@ const TOOLS = [
         types: { type: 'string', description: `Message types; default ${DEFAULT_WAIT_TYPES}` },
         peek: { type: 'boolean', description: 'Peek without consuming' },
         all: { type: 'boolean', description: 'For check: all messages' },
+        bot: {
+          type: 'string',
+          description:
+            'For ask: bot name (for example "Workspace cleanup"). Sent as --to bot:<name>. Not a worktree or dispatch id.',
+        },
+        question: {
+          type: 'string',
+          description: 'For ask: the question text. Sent once as --type question --body.',
+        },
+        chat: {
+          type: 'string',
+          description:
+            'For ask: optional chat id from `orca bot chats`. Omit to use the bot Home Chat. "new" starts a chat and is still a question.',
+        },
+        type: {
+          type: 'string',
+          description:
+            'For ask: only "question" is accepted. handoff and any other type are rejected and nothing is sent. Omit to send a question.',
+        },
         verbose: {
           type: 'boolean',
           description:
@@ -2946,6 +3258,7 @@ const TOOL_ALIASES = {
   coordinator: 'guide',
   check: 'check',
   orca_check: 'check',
+  ask: 'ask',
 };
 
 function pickArgs(args = {}) {
@@ -3003,7 +3316,7 @@ async function healthPayload({ verbose = false } = {}) {
       workerUid: workerIsolationHealth(WORKER_ISOLATION),
     },
     hindsightTarget: HINDSIGHT_URL.href,
-    actions: ['health', 'dispatch', 'await', 'release', 'reclaim', 'guide', 'check', 'cli'],
+    actions: ['health', 'dispatch', 'await', 'release', 'reclaim', 'ask', 'guide', 'check', 'cli'],
     toolsets: TOOLSET_GATE.snapshot(),
     actionAnnotations: ACTION_ANNOTATIONS,
     audit: {
@@ -3076,6 +3389,7 @@ async function callTool(name, args = {}) {
     if (action === 'health' || action === 'bridge_health') op = 'health';
     else if (action === 'dispatch' || action === 'dispatch_worker') op = 'dispatch';
     else if (action === 'await' || action === 'awaitdispatch' || action === 'await_dispatch') op = 'await';
+    else if (action === 'ask' || action === 'ask_bot') op = 'ask';
     else if (action === 'release' || action === 'release_worker') op = 'release';
     else if (action === 'reclaim' || action === 'reclaim_worker') op = 'reclaim';
     else if (action === 'guide' || action === 'coordinator') op = 'guide';
@@ -3086,7 +3400,7 @@ async function callTool(name, args = {}) {
       else if (!action) op = 'health';
       else op = 'cli';
     } else {
-      throw new Error(`unknown action "${a.action}". Use health|dispatch|await|release|reclaim|guide|check|cli`);
+      throw new Error(`unknown action "${a.action}". Use health|dispatch|await|ask|release|reclaim|guide|check|cli`);
     }
   }
   // Capability toolset gate (after action resolve, before orch lock).
@@ -3101,7 +3415,7 @@ async function callTool(name, args = {}) {
 
   // Serialize orch mutations per client so parallel dispatch/await of the same
   // coordinator cannot rebind its own sender mid-flight (mechanism A′).
-  const needsOrchLock = op === 'dispatch' || op === 'await' || op === 'release' || op === 'reclaim' || op === 'check'
+  const needsOrchLock = op === 'dispatch' || op === 'await' || op === 'ask' || op === 'release' || op === 'reclaim' || op === 'check'
     || (op === 'cli' && Array.isArray(a.args) && a.args[0] === 'orchestration');
   if (needsOrchLock) {
     return withAbortableLock(
@@ -3141,6 +3455,16 @@ async function callToolUnlocked(op, a) {
       ack: a.ack,
       types: a.types,
       peek: a.peek,
+    });
+  }
+
+  if (op === 'ask') {
+    return askBot({
+      bot: a.bot,
+      question: a.question,
+      chat: a.chat,
+      type: a.type,
+      wait_ms: a.waitMs,
     });
   }
 
@@ -3326,6 +3650,7 @@ async function handleRpc(msg, { sessionId } = {}) {
             'Runtime/version self-checked lazily on dispatch/await/release (errors include code+recovery). ' +
             'Empty await carries liveness active|idle|stalled|unknown — re-call while active/idle; stalled → diagnose (peek/ping/release+report). ' +
             'question → cli orchestration reply then await+ack. Prefer summary.status over next.action; honor liveness on empty. ' +
+            'ask {bot, question} sends one --type question to bot:<name> and peeks the reply mailbox (run:<id> when this sender is bound; never consumes). handoff is rejected and nothing is resent. ' +
             'health = optional compact diagnostics (verbose:true for full dump). guide = waves/brief/devices/stop-conditions. ' +
             'worker_done contract auto-appended on dispatch. ' +
             'Per-OAuth-client sender pin-by-handle (0.2.12+) — no mid-wave recreate; multi-coord safe. ' +

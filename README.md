@@ -387,10 +387,29 @@ Example wave:
 // 3. cleanup
 { "action": "release", "dispatchId": "<…>", "terminalHandle": "<worker handle from dispatch>" }
 
+// ask a bot (question only; the call returns when the reply arrives)
+{ "action": "ask", "bot": "Workspace cleanup", "question": "あなたは何をする bot ですか", "waitMs": 45000 }
+
 // recovery: ownership lost after a bridge restart or a failed dispatch (handle_not_owned)
 { "action": "reclaim", "taskId": "<task_id from dispatch>" }
 { "action": "release", "terminalHandle": "<…>", "taskId": "<…>" }
 ```
+
+## Asking a bot
+
+`action=ask` sends one question to an Orca bot and returns when the reply arrives. The wait uses `orchestration check --peek --wait` (same 45000 ms default and maximum as `await`) and does not consume the mailbox. The action is in the `dispatch` toolset, so `ORCA_BRIDGE_TOOLSETS=status,dispatch` can call it. It does not need `admin`.
+
+```jsonc
+{ "action": "ask", "bot": "Workspace cleanup", "question": "あなたは何をする bot ですか", "waitMs": 45000 }
+```
+
+Only `--type question` is sent, to `bot:<name>`. Subject and body use `--subject=<text>` and `--body=<text>`, so a question that starts with `--` is still one value. `type: "handoff"` and any other type are rejected and nothing is sent. Omit `chat` to land in the bot Home Chat. Pass `chat` with an id from `orca bot chats` to mail that chat (`new` starts a chat and is still a question).
+
+A sender already bound to a run always reads `--terminal run:<that run id>` (the coordinator's Run). The send receipt's `to` / `run_id` is the bot's own mailbox and is ignored. `--terminal <sender handle>` does not see the Run mailbox. An unbound sender reads its own terminal.
+
+Ask never marks mail handled. Orca's consuming check takes a whole FIFO batch, so one reply cannot be marked read by itself. A later `await` omits only the reply message id `ask` returned. Other rows on that thread (a follow-up, an unanswered notice) are still reported. The id list lives in the bridge process. After a restart the next `await` reports that reply as a normal message. When the batch is only that bot answer, the same `await` reads the following batch, so a `worker_done` behind it is not delayed by another window.
+
+An unknown bot returns `bot_not_found`. A paused bot returns `bot_paused`. No reply before the window ends returns `reply_timeout`, including `mailboxes[].terminal` and a short `rows` summary (`type`, `from`, `request_id`, `thread_id`, truncated `body`). In every one of those cases the question is not sent again (`resent: false`).
 <!-- END GENERATED: coordinator-discipline -->
 
 ### Terminal send — submit with `--enter`

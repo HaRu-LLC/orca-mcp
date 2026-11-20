@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **Ask a bot.** `action=ask` sends one `--type question` to `bot:<name>` and
+  peeks the coordinator's bound Run (`--terminal run:<id>`). The send receipt's
+  run or dispatch is the bot's mailbox and is not used. Ask does not consume.
+  A later `await` omits only that reply's message id. After a restart the reply
+  is a normal message, and the same await reads the next batch so `worker_done`
+  behind a bot answer is not delayed. `handoff` is rejected. The action is in
+  the `dispatch` toolset.
+
 - **Structured chat sessions.** `dispatch` accepts `launch.outcome.kind=structured`
   (`structured-agent-session-<id>`). The brief, including the `worker_done`
   contract, is mailed to `orca_session_id:<id>` (no `--inject`, no `terminal close`).
