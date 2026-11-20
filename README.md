@@ -397,15 +397,19 @@ Example wave:
 
 ## Asking a bot
 
-`action=ask` sends one question to an Orca bot and waits on the same `orchestration check --wait` that `await` uses. It returns when the reply arrives, not at the end of the window. The wait is the same as `await` (default and maximum 45000 ms). The action is in the `dispatch` toolset, so `ORCA_BRIDGE_TOOLSETS=status,dispatch` can call it. It does not need `admin`.
+`action=ask` sends one question to an Orca bot and returns when the reply arrives. The wait uses `orchestration check --peek --wait` (same 45000 ms default and maximum as `await`) and does not consume the mailbox. The action is in the `dispatch` toolset, so `ORCA_BRIDGE_TOOLSETS=status,dispatch` can call it. It does not need `admin`.
 
 ```jsonc
 { "action": "ask", "bot": "Workspace cleanup", "question": "あなたは何をする bot ですか", "waitMs": 45000 }
 ```
 
-Only `--type question` is sent, to `bot:<name>`. `type: "handoff"` and any other type are rejected and nothing is sent. Omit `chat` to land in the bot Home Chat. Pass `chat` with an id from `orca bot chats` to mail that chat (`new` starts a chat and is still a question).
+Only `--type question` is sent, to `bot:<name>`. Subject and body use `--subject=<text>` and `--body=<text>`, so a question that starts with `--` is still one value. `type: "handoff"` and any other type are rejected and nothing is sent. Omit `chat` to land in the bot Home Chat. Pass `chat` with an id from `orca bot chats` to mail that chat (`new` starts a chat and is still a question).
 
-An unknown bot returns `bot_not_found`. A paused bot returns `bot_paused`. No reply before the window ends returns `reply_timeout`. In every one of those cases the question is not sent again (`resent: false`).
+A sender already bound to a run reads the reply at `--terminal run:<run_id>` (or `dispatch:<id>` when the send receipt names that mailbox). `--terminal <sender handle>` does not see that mail. An unbound sender reads its own terminal mailbox.
+
+Ask never marks mail handled. A later `await` drops a reply this client already received from `ask`, so the same answer is not reported twice. Other messages in that delivery, including `worker_done`, are still reported. Await's own check may consume the leftover reply row; the summary will not treat it as a new question.
+
+An unknown bot returns `bot_not_found`. A paused bot returns `bot_paused`. No reply before the window ends returns `reply_timeout`, including `mailboxes[].terminal` and a short `rows` summary (`type`, `from`, `request_id`, `thread_id`, truncated `body`). In every one of those cases the question is not sent again (`resent: false`).
 <!-- END GENERATED: coordinator-discipline -->
 
 ### Terminal send — submit with `--enter`

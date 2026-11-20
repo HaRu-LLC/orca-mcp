@@ -80,12 +80,14 @@ import {
   buildBotQuestionSendArgv,
   buildBotReplyCheckArgv,
   buildBotReplyInboxArgv,
+  replyMailboxAddress,
   extractBots,
   findBot,
   sentMessageId,
   messagesFromEnvelope,
   matchBotReply,
-  batchIsOnlyBotReply,
+  summarizeMailboxRows,
+  dropSeenBotReplies,
   answerView,
   checkTimedOut,
 } from './lib/bot-question.mjs';
@@ -405,6 +407,21 @@ function markRunBound(runId, senderHandle) {
   const reg = ownershipFor(currentClientKey());
   reg.boundRunId = runId ? String(runId) : null;
   reg.boundSender = senderHandle ? String(senderHandle) : null;
+}
+
+/** Replies action=ask already returned. Await drops these so it does not report them again. */
+function seenBotReplies() {
+  const reg = ownershipFor(currentClientKey());
+  if (!reg.seenBotReplies) {
+    reg.seenBotReplies = { replyIds: new Set(), questionIds: new Set() };
+  }
+  return reg.seenBotReplies;
+}
+
+function rememberSeenBotReply({ replyId, questionId } = {}) {
+  const seen = seenBotReplies();
+  if (replyId) seen.replyIds.add(String(replyId));
+  if (questionId) seen.questionIds.add(String(questionId));
 }
 
 function isRunBound(runId, senderHandle) {
@@ -1337,7 +1354,7 @@ async function resolveSenderTerminal({ force = false } = {}) {
  * - mutations: --from <handle>
  * - check: --terminal <handle> (consumer identity; --from is invalid)
  */
-async function withSender(argv) {
+async function withSender(argv, { terminal = null } = {}) {
   if (!Array.isArray(argv) || argv.length < 2) return argv;
   if (argv[0] !== 'orchestration') return argv;
   const sub = argv[1];
@@ -1347,14 +1364,14 @@ async function withSender(argv) {
   if (!needsFrom && !needsTerminal) return argv;
 
   const sender = await resolveSenderTerminal();
-  return injectSenderArgv(argv, sender.handle);
+  return injectSenderArgv(argv, sender.handle, ORCH_FROM_CMDS, { terminal });
 }
 
-async function runJson(argv, { timeoutMs, cwd, injectSender = true } = {}) {
+async function runJson(argv, { timeoutMs, cwd, injectSender = true, terminal = null } = {}) {
   let finalArgv = argv;
   if (injectSender && Array.isArray(argv) && argv[0] === 'orchestration') {
     try {
-      finalArgv = await withSender(argv);
+      finalArgv = await withSender(argv, { terminal });
     } catch (e) {
       const sub = argv[1];
       if (ORCH_FROM_CMDS.has(sub) || sub === 'check' || sub === 'inbox') {
@@ -2577,7 +2594,10 @@ async function awaitDispatch(args = {}) {
   }
 
   const res = env.result || env;
-  const rawMessages = res.messages || [];
+  // Ask only peeks. A reply it already returned stays unread until this check
+  // consumes the delivery. Drop it here so await does not report it again.
+  // Other rows in that delivery (worker_done included) are unchanged.
+  const rawMessages = dropSeenBotReplies(res.messages || [], seenBotReplies());
   const deliveryId = pick(res, 'deliveryId', 'delivery_id');
   const owned = ownershipFor(currentClientKey()).dispatches;
   const { own: messages, foreign: foreignMessages, filtered } = partitionMailbox(
@@ -2777,7 +2797,7 @@ async function awaitDispatch(args = {}) {
   };
 }
 
-function botReplyTimeout(waitMs, messageId) {
+function botReplyTimeout(waitMs, messageId, mailbox) {
   return {
     ok: false,
     error: 'reply_timeout',
@@ -2788,10 +2808,11 @@ function botReplyTimeout(waitMs, messageId) {
     resent: false,
     consumed: false,
     detail: 'No reply arrived before the wait window. The question was sent once and was not resent.',
+    mailboxes: mailbox ? [mailbox] : [],
   };
 }
 
-function botCheckFailed(described, waitMs) {
+function botCheckFailed(described, waitMs, mailbox) {
   return {
     ok: false,
     error: 'check_failed',
@@ -2799,86 +2820,89 @@ function botCheckFailed(described, waitMs) {
     window_ms: waitMs,
     sent: true,
     resent: false,
+    mailboxes: mailbox ? [mailbox] : [],
     detail: described?.envelope?.error?.message || described?.error || 'check failed; the question was not resent.',
   };
 }
 
-async function consumeBotReply(messages, reply, ctx, runId) {
-  if (!batchIsOnlyBotReply(messages, reply, ctx)) {
-    return { consumed: false, leftInInbox: true };
-  }
-  const described = await runJson(
-    buildBotReplyCheckArgv({ waitMs: 0, peek: false, runId }),
-    { timeoutMs: 20_000 },
-  );
-  // envOk returns the envelope object on success, not a boolean.
-  const consumed = Boolean(envOk(described));
-  return { consumed, leftInInbox: !consumed };
-}
-
 /**
- * One question to bot:<name>. Send once, then the same check --wait await uses.
- * Returns when the reply is in the mailbox. Does not resend.
+ * One question to bot:<name>. Send once, then peek the reply mailbox.
+ * Never consumes. A bound coordinator is read at `--terminal run:<id>`
+ * (or `dispatch:<id>`), not at the sender handle.
  */
-async function waitForBotReply({ messageId, botName, waitMs, runId }) {
+async function waitForBotReply({ messageId, botName, waitMs, mailbox, mailboxLabel }) {
   const ctx = { messageId, botName };
   const deadline = Date.now() + waitMs;
+  const watched = {
+    terminal: mailboxLabel,
+    rows: [],
+  };
 
-  function finish(reply, { consumed, leftInInbox }) {
+  function note(envelope) {
+    const messages = messagesFromEnvelope(envelope);
+    watched.rows = summarizeMailboxRows(messages);
+    return messages;
+  }
+
+  function finish(reply) {
     const view = answerView(reply);
     return {
       ok: true,
       timedOut: false,
       window_ms: waitMs,
-      consumed: consumed === true,
-      left_in_inbox: leftInInbox === true,
+      consumed: false,
+      left_in_inbox: true,
       sent: true,
       answer: view,
       text: view?.body || '',
+      mailboxes: [watched],
     };
   }
 
-  async function take(messages) {
-    const reply = matchBotReply(messages, ctx);
-    if (!reply) return null;
-    const consumed = await consumeBotReply(messages, reply, ctx, runId);
-    return finish(reply, consumed);
+  const runOpts = { terminal: mailbox || null };
+
+  async function peek(ms) {
+    return runJson(buildBotReplyCheckArgv({ waitMs: ms, mailbox }), {
+      timeoutMs: (ms > 0 ? ms : 0) + 30_000,
+      ...runOpts,
+    });
   }
 
   if (!(waitMs > 0)) {
-    const described = await runJson(
-      buildBotReplyCheckArgv({ waitMs: 0, peek: true, runId }),
-      { timeoutMs: 20_000 },
-    );
-    if (!envOk(described)) return botCheckFailed(described, waitMs);
-    return (await take(messagesFromEnvelope(described.envelope))) || botReplyTimeout(waitMs, messageId);
+    const described = await peek(0);
+    if (!envOk(described)) return botCheckFailed(described, waitMs, watched);
+    const messages = note(described.envelope);
+    const reply = matchBotReply(messages, ctx);
+    return reply ? finish(reply) : botReplyTimeout(waitMs, messageId, watched);
   }
 
-  const described = await runJson(
-    buildBotReplyCheckArgv({ waitMs, peek: true, runId }),
-    { timeoutMs: waitMs + 30_000 },
-  );
-  if (!envOk(described)) return botCheckFailed(described, waitMs);
-  const messages = messagesFromEnvelope(described.envelope);
-  const ready = await take(messages);
-  if (ready) return ready;
+  const described = await peek(waitMs);
+  if (!envOk(described)) return botCheckFailed(described, waitMs, watched);
+  const messages = note(described.envelope);
+  const reply = matchBotReply(messages, ctx);
+  if (reply) return finish(reply);
   if (checkTimedOut(described.envelope, messages) || Date.now() >= deadline) {
-    return botReplyTimeout(waitMs, messageId);
+    return botReplyTimeout(waitMs, messageId, watched);
   }
 
-  // Other unread mail woke check at once. Poll inbox until the same deadline
-  // so that mail stays for await, and so a second check --wait does not spin.
+  // Unrelated unread woke the peek immediately. Keep reading the same mailbox
+  // with inbox (also non-consuming) until the deadline. Do not check again:
+  // a second --wait would return the same unread at once.
   while (Date.now() < deadline) {
-    const inbox = await runJson(buildBotReplyInboxArgv({ runId }), { timeoutMs: 20_000 });
+    const inbox = await runJson(buildBotReplyInboxArgv({ mailbox }), {
+      timeoutMs: 20_000,
+      ...runOpts,
+    });
     if (envOk(inbox)) {
-      const reply = matchBotReply(messagesFromEnvelope(inbox.envelope), ctx);
-      if (reply) return finish(reply, { consumed: false, leftInInbox: true });
+      const rows = note(inbox.envelope);
+      const found = matchBotReply(rows, ctx);
+      if (found) return finish(found);
     }
     const remaining = deadline - Date.now();
     if (remaining <= 0) break;
     await sleep(Math.min(BOT_REPLY_POLL_MS, remaining));
   }
-  return botReplyTimeout(waitMs, messageId);
+  return botReplyTimeout(waitMs, messageId, watched);
 }
 
 async function askBot(args = {}) {
@@ -2974,8 +2998,18 @@ async function askBot(args = {}) {
     };
   }
   const reg = ownershipFor(currentClientKey());
-  const runId = reg.boundRunId && reg.boundSender === sender.handle ? reg.boundRunId : null;
-  const waited = await waitForBotReply({ messageId, botName: canonical, waitMs, runId });
+  const boundRunId = reg.boundRunId && reg.boundSender === sender.handle ? reg.boundRunId : null;
+  const mailbox = replyMailboxAddress({ boundRunId, sendEnvelope: sent.envelope });
+  const waited = await waitForBotReply({
+    messageId,
+    botName: canonical,
+    waitMs,
+    mailbox,
+    mailboxLabel: mailbox || sender.handle,
+  });
+  if (waited.ok) {
+    rememberSeenBotReply({ replyId: waited.answer?.id, questionId: messageId });
+  }
   return {
     ...waited,
     bot: canonical,
@@ -2983,7 +3017,7 @@ async function askBot(args = {}) {
     question_id: messageId,
     chat: chat.chat,
     sender_handle: sender.handle,
-    run_id: runId,
+    run_id: boundRunId,
     resent: false,
   };
 }
@@ -3589,7 +3623,7 @@ async function handleRpc(msg, { sessionId } = {}) {
             'Runtime/version self-checked lazily on dispatch/await/release (errors include code+recovery). ' +
             'Empty await carries liveness active|idle|stalled|unknown — re-call while active/idle; stalled → diagnose (peek/ping/release+report). ' +
             'question → cli orchestration reply then await+ack. Prefer summary.status over next.action; honor liveness on empty. ' +
-            'ask {bot, question} sends one --type question to bot:<name> and returns when check --wait sees the reply (same window as await). handoff is rejected and nothing is resent. ' +
+            'ask {bot, question} sends one --type question to bot:<name> and peeks the reply mailbox (run:<id> when this sender is bound; never consumes). handoff is rejected and nothing is resent. ' +
             'health = optional compact diagnostics (verbose:true for full dump). guide = waves/brief/devices/stop-conditions. ' +
             'worker_done contract auto-appended on dispatch. ' +
             'Per-OAuth-client sender pin-by-handle (0.2.12+) — no mid-wave recreate; multi-coord safe. ' +
