@@ -18,10 +18,10 @@
 2. spec（`worker_done` 契約を含む）は上記の send でチャットへ渡る。
 3. await は `check --wait`。question → `orchestration reply`（toolset `dispatch`。admin の raw cli は増やしていない）→ worker_done。
 4. 作成記録は place-agent の成否を返す前、bind より前に書く。失敗した dispatch の handle を reclaim できる。チャットの生存確認は `agent list`（worktreeId が記録の path と一致する chat）。ターミナルは従来の `terminal list`。
-5. release は structured handle に `terminal close` しない。`worker-release`、それが retained または失敗なら `worker-stop`。チャットタブを閉じる専用 CLI は無い。supervised な chat worker を閉じるのは `worker-release` と worker 仕様にある。unsupervised な `orchestration dispatch` は retained でプロセスを触らない、ともある。`worker-stop` がタブ自体を閉じるかは **未確認**（実機での確認が必要）。閉じたと結果が言うときだけ worktree 削除に進む。
+5. release は structured handle に `terminal close` しない。`orchestration dispatch` が作った Dispatch の `worker-release` は仕様どおり retained（所有端末なし）で、`worker-stop` は fence のみ。どちらもチャットが閉じた証明にしない。`terminal list` が空でも worktree は消さない（`terminalClosed` を立てない。cleanup 側も structured handle は `structured_session_open` で残す）。
 
 ## 実機での確認が必要
 
 - 本物の Orca が `orchestration dispatch --to orca_session_id:…`（`--inject` なし）を受け、作業者が `worker_done` を指揮側の check に載せること。
 - 届いてから await が戻るまでの実時間。結合テストは偽物の CLI で、窓の終わりより前に戻ることを測る。
-- `worker-release` / `worker-stop` がチャットタブを実際に閉じること。
+- 実機の `worker-release` が retained を返し、`worker-stop` がタブを閉じないこと。仕様はそう書いてある。タブを閉じる専用 CLI は公開ハンドラに無い。
